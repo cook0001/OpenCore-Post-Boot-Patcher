@@ -1,9 +1,10 @@
-name: CI - Validation (External)
+name: CI - Validation
 
 on:
   push:
-    paths-ignore: 
+    paths-ignore:
       - 'docs/**'
+  pull_request:
   workflow_dispatch:
   release:
     types: [published]
@@ -12,13 +13,13 @@ jobs:
   build:
     name: Validate
     runs-on: macos-latest
-    if: github.repository_owner != 'dortania'
     steps:
       - uses: actions/checkout@v4
       - name: Install Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
+          cache: 'pip'
       - name: Install Dependencies
         run: python3 -m pip install -r requirements.txt
       - name: Validate

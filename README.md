@@ -1,3 +1,12 @@
+> **OpenCore Post-Boot Patcher (`OCPBP`)**
+>
+> Offline Recovery-bootable USB root-patching system built on the OCLP `macpro61-tahoe` baseline to eliminate post-install SSH workarounds on unsupported Macs.
+> - **Status & Architecture Site**: [ocpbp.patchcraft.dev](https://ocpbp.patchcraft.dev/)
+> - **Architecture & Refactor Plan**: [docs/OCPBP-ARCHITECTURE.md](./docs/OCPBP-ARCHITECTURE.md)
+> - **Related Tracks**: [oclp.patchcraft.dev](https://oclp.patchcraft.dev/) · [OpenCore-Patcher-GoldenGate](https://github.com/cook0001/OpenCore-Patcher-GoldenGate) · **Upstream Base**: [dortania/OpenCore-Legacy-Patcher](https://github.com/dortania/OpenCore-Legacy-Patcher)
+
+---
+
 <div align="center">
              <img src="docs/images/OC-Patcher.png" alt="OpenCore Patcher Logo" width="256" />
              <h1>OpenCore Legacy Patcher</h1>
