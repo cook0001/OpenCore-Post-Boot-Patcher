@@ -249,7 +249,7 @@ class GPU(PCIDevice):
 @dataclass
 class WirelessCard(PCIDevice):
     CLASS_CODES: ClassVar[list[int]] = [0x028000]
-    country_code: str = field(init=False)
+    country_code: Optional[str] = field(init=False, default=None)
     chipset: enum.Enum = field(init=False)
 
     def __post_init__(self):

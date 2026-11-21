@@ -414,6 +414,43 @@ class Phase5PackagingAndCITests(unittest.TestCase):
         with mock.patch("opencore_legacy_patcher.support.utilities.subprocess.run", return_value=types.SimpleNamespace(returncode=0, stdout=plistlib.dumps({"DeviceIdentifier": "disk4s3"}))):
             self.assertEqual(utilities.grab_mount_point_from_disk("disk4s3"), "")
 
+    def test_wireless_card_initializes_country_code_and_validation_unmount_retries(self):
+        from opencore_legacy_patcher import constants
+        from opencore_legacy_patcher.detections import device_probe
+        from opencore_legacy_patcher.support import validation
+
+        wifi = device_probe.Broadcom(vendor_id=0x14E4, device_id=0x43BA, class_code=0x028000)
+        self.assertIsNone(wifi.country_code)
+        self.assertIn("country_code=None", repr(wifi))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            gconst = constants.Constants()
+            payload_dir = Path(tmp) / "payloads"
+            gconst.payload_path = payload_dir
+            mount_dir = payload_dir / "Universal-Binaries"
+            overlay_file = payload_dir / "Universal-Binaries_overlay"
+            mount_dir.mkdir(parents=True)
+            overlay_file.write_bytes(b"overlay")
+
+            pv = validation.PatcherValidation.__new__(validation.PatcherValidation)
+            pv.constants = gconst
+
+            detach_results = [
+                types.SimpleNamespace(returncode=16, stdout=b"hdiutil: couldn't eject - Resource busy", stderr=b""),
+                types.SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+            ]
+            with (
+                mock.patch("opencore_legacy_patcher.support.validation.Path.is_mount", side_effect=[True, True, False]),
+                mock.patch("opencore_legacy_patcher.support.validation.subprocess.run", side_effect=detach_results + [types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")]) as run_mock,
+                mock.patch("opencore_legacy_patcher.support.validation.time.sleep") as sleep_mock,
+            ):
+                pv._unmount_dmg()
+
+            self.assertEqual(sleep_mock.call_count, 1)
+            self.assertEqual(run_mock.call_count, 3)
+            self.assertIn("detach", [str(x) for x in run_mock.call_args_list[0].args[0]])
+            self.assertIn("/bin/rm", [str(x) for x in run_mock.call_args_list[2].args[0]])
+
 
 if __name__ == "__main__":
     unittest.main()
