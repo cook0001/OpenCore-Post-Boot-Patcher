@@ -356,6 +356,7 @@ class RecoverySafetyTests(unittest.TestCase):
         c = constants.Constants()
         with tempfile.TemporaryDirectory() as tmpdir, \
              mock.patch.dict(os.environ, {"HOME": "/nonexistent_home"}), \
+             mock.patch("opencore_legacy_patcher.support.logging_handler.os.access", return_value=False), \
              mock.patch("tempfile.gettempdir", return_value=tmpdir):
             orig_handlers = list(logging.getLogger().handlers)
             try:

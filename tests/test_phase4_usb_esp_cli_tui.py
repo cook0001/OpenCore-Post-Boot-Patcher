@@ -527,12 +527,19 @@ class Phase4USBLayoutTests(unittest.TestCase):
                 if dst_path.exists():
                     shutil.rmtree(dst_path)
                 shutil.copytree(src, dst_path)
+                return types.SimpleNamespace(returncode=0, stdout=b"")
+
+            def _fake_subproc(cmd, **kw):
+                exe = Path(str(cmd[0])).name
+                if exe == "cp":
+                    return _fake_copy(cmd[-2], cmd[-1])
+                return types.SimpleNamespace(returncode=0, stdout=b"")
 
             creator = macos_installer_handler.InstallerCreation()
             with (
                 mock.patch.object(macos_installer_handler, "tmp_dir", types.SimpleNamespace(name=str(work_tmp))),
                 mock.patch("opencore_legacy_patcher.support.macos_installer_handler.can_copy_on_write", return_value=True),
-                mock.patch("opencore_legacy_patcher.support.macos_installer_handler.subprocess.run", side_effect=lambda cmd, **kw: types.SimpleNamespace(returncode=0, stdout=b"") if "codesign" in cmd[0] else _fake_copy(cmd[2], cmd[3]) if len(cmd) >= 4 else types.SimpleNamespace(returncode=0, stdout=b"")),
+                mock.patch("opencore_legacy_patcher.support.macos_installer_handler.subprocess.run", side_effect=_fake_subproc),
             ):
                 ok_ocpbp = creator.generate_installer_creation_script(
                     str(script_out),
