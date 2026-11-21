@@ -6,10 +6,10 @@ import os
 import sys
 import pprint
 import logging
+import tempfile
 import threading
 import traceback
 import subprocess
-import applescript
 
 from pathlib import Path
 from datetime import datetime
@@ -69,9 +69,13 @@ class InitializeLoggingSupport:
         """
 
         base_path = Path("~/Library/Logs").expanduser()
+        shared_path = Path("/Users/Shared")
         if not base_path.exists() or str(base_path).startswith("/var/root/"):
-            # Likely in an installer environment, store in /Users/Shared
-            base_path = Path("/Users/Shared")
+            # Likely in an installer environment, store in /Users/Shared if writable, else temp dir
+            if shared_path.exists() and os.access(shared_path, os.W_OK):
+                base_path = shared_path
+            else:
+                base_path = Path(tempfile.gettempdir())
         else:
             # create Dortania folder if it doesn't exist
             base_path = base_path / "Dortania"
@@ -80,9 +84,12 @@ class InitializeLoggingSupport:
                     base_path.mkdir()
                 except Exception as e:
                     print(f"Failed to create Dortania folder: {e}")
-                    base_path = Path("/Users/Shared")
+                    if shared_path.exists() and os.access(shared_path, os.W_OK):
+                        base_path = shared_path
+                    else:
+                        base_path = Path(tempfile.gettempdir())
 
-        self.log_filepath = Path(f"{base_path}/{self.log_filename}").expanduser()
+        self.log_filepath = base_path / self.log_filename
         self.constants.log_filepath = self.log_filepath
 
     def _clean_prior_version_logs(self) -> None:
@@ -100,17 +107,22 @@ class InitializeLoggingSupport:
         logs = []
 
         for path in paths:
-            for file in path.glob("OpenCore-Patcher*"):
-                if not file.is_file():
-                    continue
+            if not path.exists():
+                continue
+            try:
+                for file in path.glob("OpenCore-Patcher*"):
+                    if not file.is_file():
+                        continue
 
-                if not file.name.endswith(".log"):
-                    continue
+                    if not file.name.endswith(".log"):
+                        continue
 
-                if file.name == self.log_filename:
-                    continue
+                    if file.name == self.log_filename:
+                        continue
 
-                logs.append(file)
+                    logs.append(file)
+            except OSError:
+                continue
 
         logs.sort(key=lambda x: x.stat().st_mtime, reverse=True)
 
@@ -142,8 +154,11 @@ class InitializeLoggingSupport:
             ],
         )
         logging.getLogger().setLevel(logging.INFO)
-        logging.getLogger().handlers[0].setFormatter(logging.Formatter("%(message)s"))
-        logging.getLogger().handlers[1].maxBytes = self.max_file_size
+        handlers = logging.getLogger().handlers
+        if handlers:
+            handlers[0].setFormatter(logging.Formatter("%(message)s"))
+        if len(handlers) > 1 and isinstance(handlers[1], logging.FileHandler):
+            handlers[1].maxBytes = self.max_file_size
 
 
     def _attempt_initialize_logging_configuration(self) -> None:
@@ -200,6 +215,11 @@ class InitializeLoggingSupport:
                 return
 
             if self.constants.cli_mode is True:
+                return
+
+            try:
+                import applescript
+            except ImportError:
                 return
 
             error_msg = f"OpenCore Legacy Patcher encountered the following internal error:\n\n"

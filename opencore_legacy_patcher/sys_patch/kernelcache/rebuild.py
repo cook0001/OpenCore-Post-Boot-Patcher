@@ -16,11 +16,12 @@ class RebuildKernelCache:
     - auxiliary_cache: Whether to create auxiliary kernel cache (Big Sur and later)
     - auxiliary_cache_only: Whether to only create auxiliary kernel cache (Ventura and later)
     """
-    def __init__(self, os_version: os_data.os_data, mount_location: str, auxiliary_cache: bool, auxiliary_cache_only: bool) -> None:
+    def __init__(self, os_version: os_data.os_data, mount_location: str, auxiliary_cache: bool, auxiliary_cache_only: bool, mount_location_data: str = "") -> None:
         self.os_version = os_version
         self.mount_location = mount_location
         self.auxiliary_cache = auxiliary_cache
         self.auxiliary_cache_only = auxiliary_cache_only
+        self.mount_location_data = mount_location_data
 
 
     def _rebuild_method(self) -> BaseKernelCache:
@@ -31,7 +32,7 @@ class RebuildKernelCache:
             if self.os_version >= os_data.os_data.ventura:
                 if self.auxiliary_cache_only:
                     from .kernel_collection.auxiliary import AuxiliaryKernelCollection
-                    return AuxiliaryKernelCollection(self.mount_location)
+                    return AuxiliaryKernelCollection(self.mount_location, mount_location_data=self.mount_location_data)
 
             from .kernel_collection.boot_system import BootSystemKernelCollections
             return BootSystemKernelCollections(self.mount_location, self.os_version, self.auxiliary_cache)

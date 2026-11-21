@@ -3,13 +3,15 @@ kdk_handler.py: Module for parsing and determining best Kernel Debug Kit for hos
 """
 
 import logging
+import os
 import plistlib
 import requests
+import shutil
 import tempfile
 import subprocess
 import packaging.version
 
-from typing import cast
+from typing import Optional, Union, cast
 from pathlib import Path
 
 from .. import constants
@@ -56,7 +58,10 @@ class KernelDebugKitObject:
     def __init__(self, global_constants: constants.Constants,
                  host_build: str, host_version: str,
                  ignore_installed: bool = False, passive: bool = False,
-                 check_backups_only: bool = False
+                 check_backups_only: bool = False,
+                 kdk_install_path: Optional[Union[str, Path]] = None,
+                 offline_assets_dir: Optional[Union[str, Path]] = None,
+                 target_volume: Optional[Union[str, Path]] = None,
         ) -> None:
 
         self.constants: constants.Constants = global_constants
@@ -68,7 +73,17 @@ class KernelDebugKitObject:
 
         self.ignore_installed:      bool = ignore_installed   # If True, will ignore any installed KDKs and download the latest
         self.check_backups_only:    bool = check_backups_only # If True, will only check for KDK backups, not KDKs already installed
-        self.kdk_already_installed: bool = False
+        self.kdk_install_path:      Path = Path(kdk_install_path) if kdk_install_path else Path(KDK_INSTALL_PATH)
+        self.target_volume:         Path = Path(target_volume) if target_volume else Path("/")
+
+        constants_offline = getattr(global_constants, "offline_assets_dir", None)
+        resolved_offline = offline_assets_dir if offline_assets_dir is not None else constants_offline
+        self.offline_assets_dir: Optional[Path] = Path(resolved_offline) if resolved_offline else None
+
+        self.kdk_already_installed:   bool = False
+        self.kdk_available_offline:   bool = False
+        self.kdk_offline_asset_path:  str = ""
+        self.kdk_offline_asset_type:  str = ""
 
         self.kdk_installed_path: str = ""
 
@@ -91,6 +106,110 @@ class KernelDebugKitObject:
         self.error_msg: str = ""
 
         self._get_latest_kdk()
+
+
+    @property
+    def kdk_available(self) -> bool:
+        return bool(self.kdk_already_installed or self.kdk_available_offline)
+
+
+    def _offline_search_dirs(self) -> list[Path]:
+        if not self.offline_assets_dir:
+            return []
+        candidates = [
+            self.offline_assets_dir,
+            self.offline_assets_dir / "KDKs",
+            self.offline_assets_dir / "assets",
+        ]
+        return [d for d in candidates if d.is_dir()]
+
+
+    @staticmethod
+    def _read_kdk_info_plist(directory: Path) -> Optional[dict]:
+        info_path = directory / KDK_INFO_PLIST
+        if not info_path.is_file():
+            return None
+        try:
+            with info_path.open("rb") as f:
+                return plistlib.load(f)
+        except Exception:
+            return None
+
+
+    def _find_offline_kdk(self, match: Optional[str] = None, check_version: bool = False, allow_generic: bool = False) -> Optional[tuple[Path, str]]:
+        if self.ignore_installed is True:
+            return None
+        search_dirs = self._offline_search_dirs()
+        if not search_dirs:
+            return None
+
+        target_match = match or (self.host_version if check_version else self.host_build)
+
+        # 1. Extracted .kdk directories
+        for search_dir in search_dirs:
+            for item in sorted(search_dir.iterdir()):
+                if not item.is_dir() or not item.name.endswith(".kdk"):
+                    continue
+                if check_version:
+                    if target_match not in item.name:
+                        continue
+                else:
+                    if not item.name.endswith(f"{target_match}.kdk"):
+                        continue
+                if self._local_kdk_valid(item, remove_invalid=False):
+                    return (item, "dir")
+
+        # 2. .pkg / .dmg assets matching build or version
+        for ext, asset_type in ((".pkg", "pkg"), (".dmg", "dmg")):
+            for search_dir in search_dirs:
+                kdk_info = self._read_kdk_info_plist(search_dir)
+                for item in sorted(search_dir.iterdir()):
+                    if item.is_dir() or not item.name.endswith(ext):
+                        continue
+                    lower_name = item.name.lower()
+                    if "kdk" not in lower_name and "kerneldebugkit" not in lower_name:
+                        continue
+
+                    if check_version:
+                        if target_match in item.name:
+                            return (item, asset_type)
+                        if kdk_info and target_match in str(kdk_info.get("version", "")):
+                            return (item, asset_type)
+                    else:
+                        if item.name.endswith(f"{target_match}{ext}") or target_match in item.name:
+                            return (item, asset_type)
+                        if kdk_info and kdk_info.get("build") == target_match:
+                            return (item, asset_type)
+
+        # 3. Generic fallback (e.g., KDK.pkg / KernelDebugKit.pkg / KDK.dmg) when offline
+        if allow_generic:
+            for generic_name, asset_type in (
+                ("KDK.pkg", "pkg"),
+                ("KernelDebugKit.pkg", "pkg"),
+                ("KDK.dmg", "dmg"),
+                ("KernelDebugKit.dmg", "dmg"),
+            ):
+                for search_dir in search_dirs:
+                    candidate = search_dir / generic_name
+                    if candidate.is_file():
+                        return (candidate, asset_type)
+
+        return None
+
+
+    def _apply_offline_kdk_match(self, asset_path: Path, asset_type: str) -> None:
+        if asset_type == "dir":
+            logging.info(f"Found offline KDK directory: {asset_path}")
+            self.kdk_installed_path = str(asset_path)
+            self.kdk_already_installed = True
+            self.success = True
+            return
+
+        logging.info(f"Found offline KDK asset ({asset_type}): {asset_path}")
+        self.kdk_offline_asset_path = str(asset_path)
+        self.kdk_offline_asset_type = asset_type
+        self.kdk_available_offline = True
+        self.success = True
 
 
     def _get_remote_kdks(self) -> list:
@@ -158,6 +277,18 @@ class KernelDebugKitObject:
             self.success = True
             return
 
+        offline_exact = self._find_offline_kdk(match=host_build, check_version=False, allow_generic=False)
+        if offline_exact:
+            self._apply_offline_kdk_match(*offline_exact)
+            return
+
+        if self.offline_assets_dir is not None:
+            loose_version = f"{parsed_version.major}.{parsed_version.minor}"
+            offline_loose = self._find_offline_kdk(match=loose_version, check_version=True, allow_generic=True)
+            if offline_loose:
+                self._apply_offline_kdk_match(*offline_loose)
+                return
+
         remote_kdk_version = self._get_remote_kdks()
 
         if remote_kdk_version is None:
@@ -181,6 +312,11 @@ class KernelDebugKitObject:
                 logging.info(f"Found matching KDK: {Path(self.kdk_installed_path).name}")
                 self.kdk_already_installed = True
                 self.success = True
+                return
+
+            offline_fallback = self._find_offline_kdk(match=older_version, check_version=True, allow_generic=True)
+            if offline_fallback:
+                self._apply_offline_kdk_match(*offline_fallback)
                 return
 
             logging.warning(f"Couldn't find KDK matching {host_version} or {older_version}, please install one manually")
@@ -307,7 +443,7 @@ class KernelDebugKitObject:
             logging.error(f"Failed to generate KDK Info.plist: {e}")
 
 
-    def _local_kdk_valid(self, kdk_path: Path) -> bool:
+    def _local_kdk_valid(self, kdk_path: Path, remove_invalid: bool = True) -> bool:
         """
         Validates provided KDK, ensure no corruption
 
@@ -318,45 +454,56 @@ class KernelDebugKitObject:
 
         Parameters:
             kdk_path (Path): Path to KDK
+            remove_invalid (bool): Whether to remove the KDK if invalid (False for read-only offline assets)
 
         Returns:
             bool: True if valid, False if invalid
         """
 
         if not Path(f"{kdk_path}/System/Library/CoreServices/SystemVersion.plist").exists():
-            logging.info(f"Corrupted KDK found ({kdk_path.name}), removing due to missing SystemVersion.plist")
-            self._remove_kdk(kdk_path)
+            logging.info(f"Corrupted KDK found ({kdk_path.name}), missing SystemVersion.plist")
+            if remove_invalid:
+                self._remove_kdk(kdk_path)
             return False
 
         # Get build from KDK
-        kdk_plist_data = plistlib.load(Path(f"{kdk_path}/System/Library/CoreServices/SystemVersion.plist").open("rb"))
+        kdk_sysver = Path(f"{kdk_path}/System/Library/CoreServices/SystemVersion.plist")
+        with kdk_sysver.open("rb") as f:
+            kdk_plist_data = plistlib.load(f)
         if "ProductBuildVersion" not in kdk_plist_data:
-            logging.info(f"Corrupted KDK found ({kdk_path.name}), removing due to missing ProductBuildVersion")
-            self._remove_kdk(kdk_path)
+            logging.info(f"Corrupted KDK found ({kdk_path.name}), missing ProductBuildVersion")
+            if remove_invalid:
+                self._remove_kdk(kdk_path)
             return False
 
         kdk_build = kdk_plist_data["ProductBuildVersion"]
 
         # Check pkg receipts for this build, will give a canonical list if all files that should be present
-        result = subprocess.run(["/usr/sbin/pkgutil", "--files", f"com.apple.pkg.KDK.{kdk_build}"], capture_output=True)
+        pkgutil_args = ["/usr/sbin/pkgutil"]
+        if str(self.target_volume) != "/":
+            pkgutil_args += ["--volume", str(self.target_volume)]
+        pkgutil_args += ["--files", f"com.apple.pkg.KDK.{kdk_build}"]
+
+        result = subprocess.run(pkgutil_args, capture_output=True)
         if result.returncode != 0:
             # If pkg receipt is missing, we'll fallback to legacy validation
             logging.info(f"pkg receipt missing for {kdk_path.name}, falling back to legacy validation")
-            return self._local_kdk_valid_legacy(kdk_path)
+            return self._local_kdk_valid_legacy(kdk_path, remove_invalid=remove_invalid)
 
         # Go through each line of the pkg receipt and ensure it exists
         for line in result.stdout.decode("utf-8").splitlines():
             if not line.startswith("System/Library/Extensions"):
                 continue
             if not Path(f"{kdk_path}/{line}").exists():
-                logging.info(f"Corrupted KDK found ({kdk_path.name}), removing due to missing file: {line}")
-                self._remove_kdk(kdk_path)
+                logging.info(f"Corrupted KDK found ({kdk_path.name}), missing file: {line}")
+                if remove_invalid:
+                    self._remove_kdk(kdk_path)
                 return False
 
         return True
 
 
-    def _local_kdk_valid_legacy(self, kdk_path: Path) -> bool:
+    def _local_kdk_valid_legacy(self, kdk_path: Path, remove_invalid: bool = True) -> bool:
         """
         Legacy variant of validating provided KDK
         Uses best guess of files that should be present
@@ -364,6 +511,7 @@ class KernelDebugKitObject:
 
         Parameters:
             kdk_path (Path): Path to KDK
+            remove_invalid (bool): Whether to remove the KDK if invalid
 
         Returns:
             bool: True if valid, False if invalid
@@ -378,8 +526,9 @@ class KernelDebugKitObject:
 
         for kext in KEXT_CATALOG:
             if not Path(f"{kdk_path}/System/Library/Extensions/{kext}").exists():
-                logging.info(f"Corrupted KDK found, removing due to missing: {kdk_path}/System/Library/Extensions/{kext}")
-                self._remove_kdk(kdk_path)
+                logging.info(f"Corrupted KDK found ({kdk_path.name}), missing: {kdk_path}/System/Library/Extensions/{kext}")
+                if remove_invalid:
+                    self._remove_kdk(kdk_path)
                 return False
 
         return True
@@ -407,12 +556,12 @@ class KernelDebugKitObject:
             else:
                 match = self.host_build
 
-        if not Path(KDK_INSTALL_PATH).exists():
+        if not self.kdk_install_path.exists():
             return None
 
         # Installed KDKs only
         if self.check_backups_only is False:
-            for kdk_folder in Path(KDK_INSTALL_PATH).iterdir():
+            for kdk_folder in self.kdk_install_path.iterdir():
                 if not kdk_folder.is_dir():
                     continue
                 if check_version:
@@ -427,7 +576,7 @@ class KernelDebugKitObject:
 
         # If we can't find a KDK, next check if there's a backup present
         # Check for KDK packages in the same directory as the KDK
-        for kdk_pkg in Path(KDK_INSTALL_PATH).iterdir():
+        for kdk_pkg in self.kdk_install_path.iterdir():
             if kdk_pkg.is_dir():
                 continue
             if not kdk_pkg.name.endswith(".pkg"):
@@ -442,7 +591,11 @@ class KernelDebugKitObject:
             logging.info(f"Found KDK backup: {kdk_pkg.name}")
             if self.passive is False:
                 logging.info("Attempting KDK restoration")
-                if KernelDebugKitUtilities().install_kdk_pkg(kdk_pkg):
+                if KernelDebugKitUtilities().install_kdk_pkg(
+                    kdk_pkg,
+                    target_volume=self.target_volume,
+                    kdk_install_path=self.kdk_install_path,
+                ):
                     logging.info("Successfully restored KDK")
                     return self._local_kdk_installed(match=match, check_version=check_version)
             else:
@@ -500,15 +653,15 @@ class KernelDebugKitObject:
         if self.constants.should_nuke_kdks is False:
             return
 
-        if not Path(KDK_INSTALL_PATH).exists():
+        if not self.kdk_install_path.exists():
             return
 
         logging.info("Cleaning unused KDKs")
-        for kdk_folder in Path(KDK_INSTALL_PATH).iterdir():
+        for kdk_folder in self.kdk_install_path.iterdir():
             if kdk_folder.name.endswith(".kdk") or kdk_folder.name.endswith(".pkg"):
                 should_remove = True
                 for build in exclude_builds:
-                    if kdk_folder.name.endswith(f"_{build}.kdk") or kdk_folder.name.endswith(f"_{build}.pkg"):
+                    if build and (kdk_folder.name.endswith(f"_{build}.kdk") or kdk_folder.name.endswith(f"_{build}.pkg")):
                         should_remove = False
                         break
                 if should_remove is False:
@@ -538,7 +691,7 @@ class KernelDebugKitObject:
             return False
 
         # TODO: should we use the checksum from the API?
-        result = subprocess.run(["/usr/bin/hdiutil", "verify", self.constants.kdk_download_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(["/usr/bin/hdiutil", "verify", kdk_dmg_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if result.returncode != 0:
             logging.info("Error: Kernel Debug Kit checksum verification failed!")
             subprocess_wrapper.log(result)
@@ -564,7 +717,61 @@ class KernelDebugKitUtilities:
         pass
 
 
-    def install_kdk_pkg(self, kdk_path: Path) -> bool:
+    def _extract_kdk_pkg_offline(self, kdk_path: Path, dest_dir: Path) -> bool:
+        """
+        Extract a KDK .pkg directly into `<target_data>/Library/Developer/KDKs`
+        using a staging directory on `dest_dir` (never touching Recovery's `/`).
+        """
+        subprocess_wrapper.run_as_root(["/bin/mkdir", "-p", str(dest_dir)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        stage_dir = dest_dir / f".ocpbp_kdk_stage_{os.getpid()}"
+        if stage_dir.exists():
+            subprocess_wrapper.run_as_root(["/bin/rm", "-rf", str(stage_dir)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+        expanded_dir = stage_dir / "expanded"
+        try:
+            result = subprocess_wrapper.run_as_root(
+                ["/usr/sbin/pkgutil", "--expand-full", str(kdk_path), str(expanded_dir)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            if result.returncode != 0:
+                logging.warning("pkgutil --expand-full failed for offline KDK package")
+                subprocess_wrapper.log(result)
+                return False
+
+            kdk_bundles = [
+                p for p in expanded_dir.rglob("*.kdk")
+                if p.is_dir() and (p / "System/Library/Extensions").is_dir()
+            ]
+            if not kdk_bundles:
+                logging.warning(f"No .kdk bundle found inside expanded package: {kdk_path}")
+                return False
+
+            for kdk_bundle in kdk_bundles:
+                target_bundle = dest_dir / kdk_bundle.name
+                if target_bundle.exists():
+                    subprocess_wrapper.run_as_root(["/bin/rm", "-rf", str(target_bundle)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                move_res = subprocess_wrapper.run_as_root(
+                    ["/bin/mv", str(kdk_bundle), str(target_bundle)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+                if move_res.returncode != 0:
+                    subprocess_wrapper.log(move_res)
+                    return False
+
+            return True
+        finally:
+            if stage_dir.exists():
+                subprocess_wrapper.run_as_root(["/bin/rm", "-rf", str(stage_dir)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+
+    def install_kdk_pkg(
+        self,
+        kdk_path: Path,
+        target_volume: Optional[Union[str, Path]] = None,
+        kdk_install_path: Optional[Union[str, Path]] = None,
+    ) -> bool:
         """
         Installs provided KDK packages
 
@@ -578,9 +785,20 @@ class KernelDebugKitUtilities:
         logging.info(f"Installing KDK package: {kdk_path.name}")
         logging.info(f"- This may take a while...")
 
+        resolved_target = str(target_volume) if target_volume else "/"
+        resolved_install_dir = Path(kdk_install_path) if kdk_install_path else (
+            Path(resolved_target) / "Library/Developer/KDKs" if resolved_target != "/" else Path(KDK_INSTALL_PATH)
+        )
+
+        if resolved_install_dir != Path(KDK_INSTALL_PATH) or resolved_target != "/":
+            if self._extract_kdk_pkg_offline(Path(kdk_path), resolved_install_dir):
+                return True
+            if resolved_target == "/":
+                return False
+
         # TODO: Check whether enough disk space is available
 
-        result = subprocess_wrapper.run_as_root(["/usr/sbin/installer", "-pkg", kdk_path, "-target", "/"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        result = subprocess_wrapper.run_as_root(["/usr/sbin/installer", "-pkg", kdk_path, "-target", resolved_target], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if result.returncode != 0:
             logging.info("Failed to install KDK:")
             subprocess_wrapper.log(result)
@@ -588,7 +806,13 @@ class KernelDebugKitUtilities:
         return True
 
 
-    def install_kdk_dmg(self, kdk_path: Path, only_install_backup: bool = False) -> bool:
+    def install_kdk_dmg(
+        self,
+        kdk_path: Path,
+        only_install_backup: bool = False,
+        target_volume: Optional[Union[str, Path]] = None,
+        kdk_install_path: Optional[Union[str, Path]] = None,
+    ) -> bool:
         """
         Installs provided KDK disk image
 
@@ -615,11 +839,12 @@ class KernelDebugKitUtilities:
 
 
             if only_install_backup is False:
-                if self.install_kdk_pkg(kdk_pkg_path) is False:
+                if self.install_kdk_pkg(kdk_pkg_path, target_volume=target_volume, kdk_install_path=kdk_install_path) is False:
                     self._unmount_disk_image(mount_point)
                     return False
 
-            self._create_backup(kdk_pkg_path, Path(f"{kdk_path.parent}/{KDK_INFO_PLIST}"))
+            if not kdk_install_path or Path(kdk_install_path) == Path(KDK_INSTALL_PATH):
+                self._create_backup(kdk_pkg_path, Path(f"{Path(kdk_path).parent}/{KDK_INFO_PLIST}"), kdk_install_path=kdk_install_path)
             self._unmount_disk_image(mount_point)
 
         logging.info("Successfully installed KDK")
@@ -635,7 +860,12 @@ class KernelDebugKitUtilities:
         subprocess.run(["/usr/bin/hdiutil", "detach", mount_point], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
 
-    def _create_backup(self, kdk_path: Path, kdk_info_plist: Path) -> None:
+    def _create_backup(
+        self,
+        kdk_path: Path,
+        kdk_info_plist: Path,
+        kdk_install_path: Optional[Union[str, Path]] = None,
+    ) -> None:
         """
         Creates a backup of the KDK
 
@@ -657,11 +887,12 @@ class KernelDebugKitUtilities:
             logging.warning("Malformed KDK Info.plist provided, cannot create backup")
             return
 
-        if not Path(KDK_INSTALL_PATH).exists():
-            subprocess_wrapper.run_as_root(["/bin/mkdir", "-p", KDK_INSTALL_PATH], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        install_dir = Path(kdk_install_path) if kdk_install_path else Path(KDK_INSTALL_PATH)
+        if not install_dir.exists():
+            subprocess_wrapper.run_as_root(["/bin/mkdir", "-p", install_dir], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
         kdk_dst_name = f"KDK_{kdk_info_dict['version']}_{kdk_info_dict['build']}.pkg"
-        kdk_dst_path = Path(f"{KDK_INSTALL_PATH}/{kdk_dst_name}")
+        kdk_dst_path = install_dir / kdk_dst_name
 
         logging.info(f"Creating backup: {kdk_dst_name}")
         if kdk_dst_path.exists():

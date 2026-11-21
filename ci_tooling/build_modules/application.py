@@ -9,6 +9,16 @@ from opencore_legacy_patcher.volume  import generate_copy_arguments
 from opencore_legacy_patcher.support import subprocess_wrapper
 
 
+def _patch_min_macosx_load_command(binary_path: Path) -> None:
+    """
+    Patch LC_VERSION_MIN_MACOSX in Load Command from 10.13 (0xA0D) to 10.10 (0xA0A).
+    """
+    print(f"Patching LC_VERSION_MIN_MACOSX ({binary_path.name})")
+    data = binary_path.read_bytes()
+    data = data.replace(b"\x00\x0D\x0A\x00", b"\x00\x0A\x0A\x00", 1)
+    binary_path.write_bytes(data)
+
+
 class GenerateApplication:
     """
     Generate OpenCore-Patcher.app
@@ -118,17 +128,7 @@ class GenerateApplication:
               sdk 10.9
         """
         _file = self._application_output / "Contents" / "MacOS" / "OpenCore-Patcher"
-
-        _find    = b'\x00\x0D\x0A\x00' # 10.13 (0xA0D)
-        _replace = b'\x00\x0A\x0A\x00' # 10.10 (0xA0A)
-
-        print("Patching LC_VERSION_MIN_MACOSX")
-        with open(_file, "rb") as f:
-            data = f.read()
-            data = data.replace(_find, _replace, 1)
-
-        with open(_file, "wb") as f:
-            f.write(data)
+        _patch_min_macosx_load_command(_file)
 
 
     def _patch_sdk_version(self) -> None:
@@ -187,6 +187,17 @@ class GenerateApplication:
             stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
 
+        ocpbp_binary = Path("./dist/ocpbp")
+        if ocpbp_binary.is_file():
+            print("Embedding headless ocpbp binary into OpenCore-Patcher.app/Contents/MacOS/ocpbp")
+            dst_ocpbp = self._application_output / "Contents" / "MacOS" / "ocpbp"
+            subprocess_wrapper.run_and_verify(
+                generate_copy_arguments(str(ocpbp_binary), str(dst_ocpbp)),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            if dst_ocpbp.exists():
+                dst_ocpbp.chmod(0o755)
+
 
     def generate(self) -> None:
         """
@@ -200,3 +211,39 @@ class GenerateApplication:
         self._patch_sdk_version() if not self._git_branch or not self._git_branch.startswith('refs/tags') else None
         self._embed_git_data()
         self._embed_resources()
+
+
+class GenerateHeadlessApplication:
+    """
+    Generate standalone headless ocpbp Recovery CLI/TUI binary
+    """
+
+    def __init__(self, reset_pyinstaller_cache: bool = False) -> None:
+        self._pyinstaller = [sys.executable, "-m", "PyInstaller"]
+        self._binary_output = Path("./dist/ocpbp")
+        self._reset_pyinstaller_cache = reset_pyinstaller_cache
+
+    def _generate_binary(self) -> None:
+        if self._binary_output.exists():
+            subprocess_wrapper.run_and_verify(
+                ["/bin/rm", "-rf", self._binary_output],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+
+        print("Generating headless ocpbp binary")
+        args = self._pyinstaller + ["./OpenCore-Post-Boot-Patcher.spec", "--noconfirm"]
+        if self._reset_pyinstaller_cache:
+            args.append("--clean")
+
+        subprocess_wrapper.run_and_verify(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if self._binary_output.exists():
+            self._binary_output.chmod(0o755)
+
+    def _patch_load_command(self) -> None:
+        if not self._binary_output.is_file():
+            return
+        _patch_min_macosx_load_command(self._binary_output)
+
+    def generate(self) -> None:
+        self._generate_binary()
+        self._patch_load_command()

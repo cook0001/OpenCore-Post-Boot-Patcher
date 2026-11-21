@@ -34,6 +34,9 @@ class APFSSnapshot:
         """
         if self.xnu_major < os_data.os_data.big_sur.value:
             return True
+        if not self.mount_path:
+            logging.error("Cannot create APFS snapshot: mount_path is not set")
+            return False
 
         args = ["/usr/sbin/bless"]
         if platform.machine() == "arm64" or self._rosetta_status() is True:
@@ -45,7 +48,8 @@ class APFSSnapshot:
         if result.returncode != 0:
             logging.error("Failed to create APFS snapshot")
             subprocess_wrapper.log(result)
-            if "Can't use last-sealed-snapshot or create-snapshot on non system volume" in result.stdout.decode():
+            output_text = result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else str(result.stdout or "")
+            if "Can't use last-sealed-snapshot or create-snapshot on non system volume" in output_text:
                 logging.info("- This is an APFS bug with Monterey and newer! Perform a clean installation to ensure your APFS volume is built correctly")
 
             return False
@@ -59,6 +63,9 @@ class APFSSnapshot:
         """
         if self.xnu_major < os_data.os_data.big_sur.value:
             return True
+        if not self.mount_path:
+            logging.error("Cannot revert APFS snapshot: mount_path is not set")
+            return False
 
         result = subprocess_wrapper.run_as_root(["/usr/sbin/bless", "--mount", self.mount_path, "--bootefi", "--last-sealed-snapshot"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if result.returncode != 0:

@@ -2,13 +2,9 @@
 start.py: Start automatic patching of host
 """
 
-import wx
-import wx.html2
-
 import logging
 import plistlib
 import requests
-import markdown2
 import subprocess
 import webbrowser
 
@@ -17,10 +13,6 @@ from ... import constants
 
 from ...datasets import css_data
 
-from ...wx_gui import (
-    gui_entry,
-    gui_support
-)
 from ...support import (
     utilities,
     updates,
@@ -59,10 +51,19 @@ class StartAutomaticPatching:
 
         """
 
+        from ...wx_gui import (
+            gui_entry,
+            gui_support
+        )
+
         logging.info("- Starting Automatic Patching")
 
         dict = updates.CheckBinaryUpdates(self.constants).check_binary_updates()
         if dict:
+            import wx
+            import wx.html2
+            import markdown2
+
             version = dict["Version"]
             logging.info(f"- Found new version: {version}")
 
@@ -72,7 +73,7 @@ class StartAutomaticPatching:
             ID_GITHUB = wx.NewId()
             ID_UPDATE = wx.NewId()
 
-            url = "https://api.github.com/repos/dortania/OpenCore-Legacy-Patcher/releases/latest"
+            url = getattr(self.constants, "repo_releases_api", updates.REPO_LATEST_RELEASE_URL)
             response = requests.get(url).json()
             try:
                 changelog = response["body"].split("## Asset Information")[0]
@@ -160,7 +161,8 @@ Please check the Github page for more information about this release."""
                 logging.info("- No new binaries found on Github, proceeding with patching")
 
                 warning_str = ""
-                if network_handler.NetworkUtilities("https://api.github.com/repos/dortania/OpenCore-Legacy-Patcher/releases/latest").verify_network_connection() is False:
+                release_api_url = getattr(self.constants, "repo_releases_api", updates.REPO_LATEST_RELEASE_URL)
+                if network_handler.NetworkUtilities(release_api_url).verify_network_connection() is False:
                     warning_str = f"""\n\nWARNING: We're unable to verify whether there are any new releases of OpenCore Legacy Patcher on Github. Be aware that you may be using an outdated version for this OS. If you're unsure, verify on Github that OpenCore Legacy Patcher {self.constants.patcher_version} is the latest official release"""
 
                 args = [
@@ -236,6 +238,7 @@ Please check the Github page for more information about this release."""
         if output.returncode == 0:
             logging.info("- Launching GUI's Build/Install menu")
             self.constants.start_build_install = True
+            from ...wx_gui import gui_entry
             gui_entry.EntryPoint(self.constants).start(entry=gui_entry.SupportedEntryPoints.BUILD_OC)
 
         return False
@@ -311,6 +314,7 @@ Please check the Github page for more information about this release."""
             if output.returncode == 0:
                 logging.info("- Launching GUI's Build/Install menu")
                 self.constants.start_build_install = True
+                from ...wx_gui import gui_entry
                 gui_entry.EntryPoint(self.constants).start(entry=gui_entry.SupportedEntryPoints.BUILD_OC)
 
         except KeyError:

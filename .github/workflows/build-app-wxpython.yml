@@ -1,0 +1,108 @@
+name: Build OpenCore Post-Boot Patcher
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+  release:
+    types: [published, prereleased]
+
+jobs:
+  build-app-ocpbp:
+    name: Build GUI & Headless ocpbp
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Universal2 Python 3.11
+        run: |
+          PYTHON_BIN="/Library/Frameworks/Python.framework/Versions/3.11/bin/python3"
+          if [ ! -x "$PYTHON_BIN" ]; then
+            curl -fsSL -o /tmp/python-3.11.9-macos11.pkg https://www.python.org/ftp/python/3.11.9/python-3.11.9-macos11.pkg
+            sudo installer -pkg /tmp/python-3.11.9-macos11.pkg -target /
+            rm -f /tmp/python-3.11.9-macos11.pkg
+          fi
+          "$PYTHON_BIN" --version
+          lipo -archs /Library/Frameworks/Python.framework/Versions/3.11/Resources/Python.app/Contents/MacOS/Python
+
+      - name: Install Universal2 Dependencies
+        env:
+          ARCHFLAGS: "-arch x86_64 -arch arm64"
+        run: |
+          PYTHON_BIN="/Library/Frameworks/Python.framework/Versions/3.11/bin/python3"
+          "$PYTHON_BIN" -m pip install --upgrade pip
+          "$PYTHON_BIN" -m pip install -r requirements.txt
+          "$PYTHON_BIN" -m pip uninstall -y charset-normalizer || true
+          mkdir -p /tmp/universal2_wheels
+          "$PYTHON_BIN" -m pip download --dest /tmp/universal2_wheels --platform macosx_10_9_universal2 --only-binary=:all: charset-normalizer
+          "$PYTHON_BIN" -m pip install /tmp/universal2_wheels/charset_normalizer-*.whl
+          rm -rf /tmp/universal2_wheels
+
+      - name: Run OCPBP Test Suite
+        run: /Library/Frameworks/Python.framework/Versions/3.11/bin/python3 -m unittest discover -s tests -v
+
+      - name: Validate Patcher Builds
+        run: |
+          PYTHON_BIN="/Library/Frameworks/Python.framework/Versions/3.11/bin/python3"
+          "$PYTHON_BIN" OpenCore-Patcher-GUI.command --validate
+          "$PYTHON_BIN" ocpbp_cli.py --validate
+
+      - name: Build OpenCore-Patcher.app, PKGs, and standalone ocpbp
+        run: |
+          PYTHON_BIN="/Library/Frameworks/Python.framework/Versions/3.11/bin/python3"
+          COMMIT_URL="${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+          COMMIT_DATE="$(git show -s --format=%ci HEAD)"
+          "$PYTHON_BIN" Build-Project.command \
+            --git-branch "${{ github.ref }}" \
+            --git-commit-url "${COMMIT_URL}" \
+            --git-commit-date "${COMMIT_DATE}"
+
+      - name: Verify Universal2 Mach-O Architectures
+        run: |
+          lipo -archs dist/ocpbp
+          lipo -archs dist/OpenCore-Patcher.app/Contents/MacOS/OpenCore-Patcher
+          lipo -archs dist/OpenCore-Patcher.app/Contents/MacOS/ocpbp
+
+      - name: Archive Release Artifacts
+        run: |
+          mkdir -p release_artifacts
+          ditto -c -k --sequesterRsrc --keepParent dist/OpenCore-Patcher.app release_artifacts/OpenCore-Patcher.app.zip
+          ditto -c -k --keepParent dist/ocpbp release_artifacts/ocpbp-macos-universal2.zip
+          cp dist/OpenCore-Patcher.pkg release_artifacts/
+          cp dist/OpenCore-Patcher-Uninstaller.pkg release_artifacts/
+          cp dist/AutoPkg-Assets.pkg release_artifacts/
+          cp dist/ocpbp release_artifacts/
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenCore-Post-Boot-Patcher-Artifacts
+          path: release_artifacts/
+
+      - name: Upload AutoPkg-Assets.pkg for nightly fallback
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoPkg-Assets.pkg
+          path: dist/AutoPkg-Assets.pkg
+
+      - name: Attach Assets to Published GitHub Release
+        if: github.event_name == 'release' && (github.event.action == 'published' || github.event.action == 'prereleased')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            release_artifacts/OpenCore-Patcher.app.zip \
+            release_artifacts/OpenCore-Patcher.pkg \
+            release_artifacts/OpenCore-Patcher-Uninstaller.pkg \
+            release_artifacts/AutoPkg-Assets.pkg \
+            release_artifacts/ocpbp-macos-universal2.zip \
+            --clobber

@@ -194,7 +194,10 @@ def check_kext_loaded(bundle_id: str) -> str:
     if Path("/usr/bin/kmutil").exists():
         args = ["/usr/bin/kmutil", "showloaded", "--list-only", "--variant-suffix", "release", "--optional-identifier", bundle_id]
 
-    kext_loaded = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        kext_loaded = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except (OSError, subprocess.SubprocessError):
+        return ""
     if kext_loaded.returncode != 0:
         return ""
     output = kext_loaded.stdout.decode()
@@ -494,8 +497,14 @@ def get_free_space(disk=None):
     return free
 
 def grab_mount_point_from_disk(disk):
-    data = plistlib.loads(subprocess.run(["/usr/sbin/diskutil", "info", "-plist", disk], stdout=subprocess.PIPE).stdout.decode().strip().encode())
-    return data["MountPoint"]
+    result = subprocess.run(["/usr/sbin/diskutil", "info", "-plist", disk], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0 or not result.stdout.strip():
+        return ""
+    try:
+        data = plistlib.loads(result.stdout)
+    except (plistlib.InvalidFileException, TypeError):
+        return ""
+    return data.get("MountPoint", "")
 
 def monitor_disk_output(disk):
     # Returns MB written on drive
@@ -540,10 +549,16 @@ def block_os_updaters():
 
 def check_boot_mode():
     # Check whether we're in Safe Mode or not
+    system_profiler = Path("/usr/sbin/system_profiler")
+    if not system_profiler.exists():
+        return None
     try:
-        sys_plist = plistlib.loads(subprocess.run(["/usr/sbin/system_profiler", "SPSoftwareDataType"], stdout=subprocess.PIPE).stdout)
+        result = subprocess.run([str(system_profiler), "SPSoftwareDataType"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if result.returncode != 0 or not result.stdout:
+            return None
+        sys_plist = plistlib.loads(result.stdout)
         return sys_plist[0]["_items"][0]["boot_mode"]
-    except (KeyError, TypeError, plistlib.InvalidFileException):
+    except (OSError, subprocess.SubprocessError, KeyError, TypeError, plistlib.InvalidFileException):
         return None
 
 
@@ -607,6 +622,16 @@ def check_cli_args():
     # validation args
     parser.add_argument("--validate", help="Runs Validation Tests for CI", action="store_true", required=False)
 
+    # OCPBP offline / Recovery args
+    parser.add_argument("--ocpbp", help="Launch OpenCore Post-Boot Patcher interactive Recovery TUI", action="store_true", required=False)
+    parser.add_argument("--target_vol", action="store", help="Path, disk identifier, UUID, or volume name of offline target macOS volume to patch", required=False)
+    parser.add_argument("--unpatch_target_vol", action="store", help="Path, disk identifier, UUID, or volume name of offline target macOS volume to unpatch", required=False)
+    parser.add_argument("--offline_assets_dir", action="store", help="Directory containing offline KDK, MetallibSupportPkg, AutoPkg-Assets, and Universal-Binaries payloads (defaults to /Volumes/OCPBP when mounted)", required=False)
+    parser.add_argument("--sync_esp", help="Rebuild and install root-patch-ready OpenCore EFI to internal ESP", action="store_true", required=False)
+    parser.add_argument("--esp_disk", action="store", help="Target internal EFI partition identifier for --sync_esp (e.g. disk0s1)", required=False)
+    parser.add_argument("--passphrase", action="store", help="FileVault passphrase or recovery key for unlocking an encrypted offline target volume", required=False)
+    parser.add_argument("--interactive_unlock", help="Prompt interactively for FileVault passphrase if target volume is locked", action="store_true", required=False)
+
     # GUI args
     parser.add_argument("--gui_patch", help="Starts GUI in Root Patcher", action="store_true", required=False)
     parser.add_argument("--gui_unpatch", help="Starts GUI in Root Unpatcher", action="store_true", required=False)
@@ -622,7 +647,11 @@ def check_cli_args():
         args.validate or
         args.auto_patch or
         args.prepare_for_update or
-        args.cache_os
+        args.cache_os or
+        args.ocpbp or
+        args.target_vol or
+        args.unpatch_target_vol or
+        args.sync_esp
     ):
         return None
     else:

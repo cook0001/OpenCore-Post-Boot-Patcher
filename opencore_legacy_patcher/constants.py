@@ -14,6 +14,7 @@ class Constants:
     def __init__(self) -> None:
         # Patcher Versioning
         self.patcher_version:                 str = "3.0.0"  # OpenCore-Legacy-Patcher
+        self.ocpbp_version:                   str = "0.0.1"  # OpenCore Post-Boot Patcher
         self.patcher_support_pkg_version:     str = "2.0.5"  # PatcherSupportPkg
         self.copyright_date:                  str = "Copyright © 2020-2026 Dortania and OpenCore Legacy Patcher contributors"
         self.patcher_name:                    str = "OpenCore Legacy Patcher"
@@ -22,9 +23,13 @@ class Constants:
         self.url_patcher_support_pkg:         str = "https://github.com/dortania/PatcherSupportPkg/releases/download/"
         self.discord_link:                    str = "https://discord.gg/rqdPgH8xSN"
         self.guide_link:                      str = "https://dortania.github.io/OpenCore-Legacy-Patcher/"
-        self.repo_link:                       str = "https://github.com/dortania/OpenCore-Legacy-Patcher"
+        self.ocpbp_docs_link:                 str = "https://ocpbp.patchcraft.dev/"
+        self.repo_slug:                       str = "cook0001/OpenCore-Post-Boot-Patcher"
+        self.repo_link:                       str = f"https://github.com/{self.repo_slug}"
+        self.repo_releases_api:               str = f"https://api.github.com/repos/{self.repo_slug}/releases/latest"
+        self.repo_branches_api:               str = f"https://api.github.com/repos/{self.repo_slug}/branches"
         self.installer_pkg_url:               str = f"{self.repo_link}/releases/download/{self.patcher_version}/AutoPkg-Assets.pkg"
-        self.installer_pkg_url_nightly:       str = "http://nightly.link/dortania/OpenCore-Legacy-Patcher/workflows/build-app-wxpython/main/AutoPkg-Assets.pkg.zip"
+        self.installer_pkg_url_nightly:       str = f"https://nightly.link/{self.repo_slug}/workflows/build-app-wxpython/main/AutoPkg-Assets.pkg.zip"
 
         # OpenCore Versioning
         # https://github.com/acidanthera/OpenCorePkg
@@ -256,6 +261,14 @@ class Constants:
             os_data.os_data.tahoe,
         ]
 
+        self.target_vol:             Optional[str] = None  #  Target macOS root/volume for offline OCPBP patching
+        self.offline_assets_dir:     Optional[Path] = None  # Directory containing offline KDK/Metallib/Universal-Binaries
+        self._payload_local_binaries_root_path_override: Optional[Path] = None
+        self.ocpbp_volume_name:      str = "OCPBP"
+        self.ocpbp_volume_mount:     Path = Path(f"/Volumes/{self.ocpbp_volume_name}")
+        self.ocpbp_cli_mode:         bool = False  # True when launched via headless ocpbp CLI/TUI entrypoint
+        self.ocpbp_usb_efi_enforce:  bool = False  # True when installer builder enforces root-patch USB EFI flags
+
     @property
     def special_build(self):
         """
@@ -277,6 +290,10 @@ class Constants:
 
     @property
     def payload_local_binaries_root_path_dmg(self):
+        if self.offline_assets_dir:
+            offline_dmg = Path(self.offline_assets_dir) / "Universal-Binaries.dmg"
+            if offline_dmg.is_file():
+                return offline_dmg
         return self.original_path / Path("Universal-Binaries.dmg")
 
     @property
@@ -783,9 +800,10 @@ class Constants:
     # Icons
     @property
     def icns_resource_path(self):
-        if self.launcher_script:
+        bundle_resources = Path(self.launcher_binary).parent.parent / Path("Resources")
+        if self.launcher_script or not bundle_resources.exists():
             return self.payload_path / Path("Icon/AppIcons")
-        return Path(self.launcher_binary).parent.parent / Path("Resources")
+        return bundle_resources
 
 
     @property
@@ -851,6 +869,8 @@ class Constants:
     # Apple Payloads Paths
     @property
     def payload_local_binaries_root_path(self):
+        if self._payload_local_binaries_root_path_override is not None:
+            return self._payload_local_binaries_root_path_override
         return self.payload_path / Path("Universal-Binaries")
 
     @property

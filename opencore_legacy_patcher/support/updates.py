@@ -15,7 +15,7 @@ from . import network_handler
 from .. import constants
 
 
-REPO_LATEST_RELEASE_URL: str = "https://api.github.com/repos/dortania/OpenCore-Legacy-Patcher/releases/latest"
+REPO_LATEST_RELEASE_URL: str = "https://api.github.com/repos/cook0001/OpenCore-Post-Boot-Patcher/releases/latest"
 
 
 class CheckBinaryUpdates:
@@ -95,10 +95,12 @@ class CheckBinaryUpdates:
             # We already checked
             return self.latest_details
 
-        if not network_handler.NetworkUtilities(REPO_LATEST_RELEASE_URL).verify_network_connection():
+        release_api_url = getattr(self.constants, "repo_releases_api", REPO_LATEST_RELEASE_URL)
+
+        if not network_handler.NetworkUtilities(release_api_url).verify_network_connection():
             return None
 
-        response = network_handler.NetworkUtilities().get(REPO_LATEST_RELEASE_URL)
+        response = network_handler.NetworkUtilities().get(release_api_url)
         data_set = response.json()
 
         if "tag_name" not in data_set:
@@ -121,7 +123,7 @@ class CheckBinaryUpdates:
                     "Name": asset["name"],
                     "Version": latest_remote_version,
                     "Link": asset["browser_download_url"],
-                    "Github Link": f"https://github.com/dortania/OpenCore-Legacy-Patcher/releases/{latest_remote_version}",
+                    "Github Link": f"{self.constants.repo_link}/releases/tag/{latest_remote_version}",
                 }
                 return self.latest_details
 

@@ -59,9 +59,34 @@ This project is offered on an AS-IS basis, we do not guarantee support for any i
   * Keep in mind that the Discord server is maintained by the community, so we ask everyone to be respectful.
   * Please review our docs on [how to debug with OpenCore](https://dortania.github.io/OpenCore-Legacy-Patcher/DEBUG.html) to gather important information to help others with troubleshooting.
 
-## Running from source
+## OpenCore Post-Boot Patcher (`OCPBP`) Workflow
+
+1. **Create Installer + Recovery USB**: Launch the GUI (`OpenCore-Patcher.app`) and select **Create macOS Installer**. On USB drives with sufficient space (~22 GB+), **Build OCPBP USB** is enabled by default and creates a 3-partition GPT layout:
+   * `EFI`: Model-specific OpenCore enforcing root-patch SIP (`csr-active-config`) and `SecureBootModel=Disabled`.
+   * `OCLP-Installer`: Version-matched macOS Installer / Recovery (`BaseSystem`).
+   * `OCPBP`: Offline companion volume containing standalone headless `ocpbp`, `ocpbp.command`, `AutoPkg-Assets.pkg`, `Universal-Binaries.dmg`, matching `KDK.pkg` (macOS 13+), and `MetallibSupportPkg.pkg` (macOS 15+).
+2. **Offline Recovery Patching**: After installing macOS to internal storage, boot from the OCPBP USB OpenCore picker into the macOS Installer / Recovery environment, open Terminal, and run `/Volumes/OCPBP/ocpbp.command` (or `/Volumes/OCPBP/ocpbp --ocpbp`).
+3. **One-Step ESP Sync & Reboot**: Inside the TUI (or CLI with `--target_vol "/Volumes/Macintosh HD" --sync_esp`), patch the internal APFS volume offline (with FileVault unlock if encrypted), optionally sync OpenCore onto the internal EFI System Partition, and reboot directly into the accelerated desktop.
+
+### Headless CLI Options (`ocpbp`)
+
+* `--ocpbp`: Launch the interactive numbered Recovery TUI (pure stdlib, no `wxPython`/`AppKit`/`AppleScript`).
+* `--target_vol <target>`: Patch an offline APFS target volume (`path`, `diskXsY`, `UUID`, or `VolumeName`), auto-discovering `/Volumes/OCPBP` unless `--offline_assets_dir` is specified.
+* `--unpatch_target_vol <target>`: Revert an offline APFS target volume back to its sealed APFS snapshot.
+* `--sync_esp` / `--esp_disk <diskXs1>`: Rebuild hardware-probed OpenCore with root-patch SIP + `SecureBootModel=Disabled` onto the internal ESP.
+* `--passphrase <secret>` / `--interactive_unlock`: Unlock FileVault-encrypted target volumes in Recovery.
+
+## Running from source & Building
 
 To run the project from source, see here: [Build and run from source](./SOURCE.md)
+
+To build both the GUI (`OpenCore-Patcher.app`, `.pkg` installers) and standalone headless `dist/ocpbp`:
+
+```bash
+python3 Build-Project.command
+# Or build only standalone headless ocpbp:
+python3 Build-Project.command --run-as-individual-steps --prepare-assets --prepare-ocpbp
+```
 
 ## Credits
 

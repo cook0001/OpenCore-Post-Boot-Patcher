@@ -33,9 +33,23 @@ class RoutePayloadDiskImage:
         Currently only applicable for GUI variant and not running from source
         """
 
-        if self.constants.wxpython_variant is True and not self.constants.launcher_script:
+        if not self.constants.launcher_script:
+            bundled_payloads = self.constants.original_path / Path("payloads")
+            if bundled_payloads.is_dir():
+                self.constants.payload_path = bundled_payloads
+                self.temp_dir = tempfile.TemporaryDirectory()
+                self.constants._payload_temp_dir = self.temp_dir
+                self.constants.current_path = Path(self.temp_dir.name)
+                logging.info(f"Using bundled payloads directory: {bundled_payloads} (build workspace: {self.constants.current_path})")
+                return
+
+            if not self.constants.payload_path_dmg.is_file():
+                logging.info("payloads.dmg not found; skipping payload disk image mount")
+                return
+
             logging.info("Running in compiled binary, switching to tmp directory")
             self.temp_dir = tempfile.TemporaryDirectory()
+            self.constants._payload_temp_dir = self.temp_dir
             logging.info(f"New payloads location: {self.temp_dir.name}")
             logging.info("Creating payloads directory")
             Path(self.temp_dir.name / Path("payloads")).mkdir(parents=True, exist_ok=True)

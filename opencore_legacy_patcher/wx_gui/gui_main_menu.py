@@ -391,7 +391,7 @@ class MainFrame(wx.Frame):
         ID_GITHUB = wx.NewId()
         ID_UPDATE = wx.NewId()
 
-        url = "https://api.github.com/repos/dortania/OpenCore-Legacy-Patcher/releases/latest"
+        url = self.constants.repo_releases_api
         response = requests.get(url).json()
         try:
             changelog = response["body"].split("## Asset Information")[0]

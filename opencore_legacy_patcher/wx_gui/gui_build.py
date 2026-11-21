@@ -137,10 +137,22 @@ class BuildFrame(wx.Frame):
         """
         Calls build function and redirects stdout to the text box
         """
+        import copy
+
         logger = logging.getLogger()
         logger.addHandler(gui_support.ThreadHandler(self.text_box))
         try:
-            build.BuildOpenCore(self.constants.custom_model or self.constants.computer.real_model, self.constants)
+            build_constants = self.constants
+            if getattr(self.constants, "ocpbp_usb_efi_enforce", False):
+                from ..ocpbp import esp_sync
+                build_constants = copy.copy(self.constants)
+                esp_sync.enforce_constants_root_patch_flags(build_constants)
+
+            build.BuildOpenCore(build_constants.custom_model or build_constants.computer.real_model, build_constants)
+
+            if getattr(self.constants, "ocpbp_usb_efi_enforce", False):
+                from ..ocpbp import esp_sync
+                esp_sync.enforce_efi_config_flags(build_constants.plist_path)
             self.build_successful = True
         except Exception as e:
             logging.error("An internal error occurred while building:\n")
@@ -150,6 +162,8 @@ class BuildFrame(wx.Frame):
             if "TypeError: unsupported type: <class 'NoneType'>" in traceback.format_exc():
                 logging.error("If you continue to see this error, delete the following file and restart the application:")
                 logging.error("Path: /Users/Shared/.com.dortania.opencore-legacy-patcher.plist")
+        finally:
+            self.constants.ocpbp_usb_efi_enforce = False
 
         logger.removeHandler(logger.handlers[2])
 

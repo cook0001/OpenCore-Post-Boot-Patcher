@@ -12,5 +12,5 @@ Usage:
 >>> RootVolumeMount(xnu_major).revert_snapshot()
 """
 
-from .mount    import RootVolumeMount
+from .mount    import APFSVolumeResolver, RootVolumeMount, TargetVolumeGroup
 from .snapshot import APFSSnapshot

@@ -3,11 +3,13 @@ metallib_handler.py: Library for handling Metal libraries
 """
 
 import logging
+import os
+import plistlib
 import requests
 import subprocess
 import packaging.version
 
-from typing  import cast
+from typing  import Optional, Union, cast
 from pathlib import Path
 
 from .  import network_handler, subprocess_wrapper
@@ -17,6 +19,7 @@ from ..datasets import os_data
 
 
 METALLIB_INSTALL_PATH: str  = "/Library/Application Support/Dortania/MetallibSupportPkg"
+METALLIB_INFO_PLIST:   str  = "MetallibInfo.plist"
 METALLIB_API_LINK:     str  = "https://dortania.github.io/MetallibSupportPkg/manifest.json"
 
 METALLIB_ASSET_LIST:   list = None
@@ -26,7 +29,10 @@ class MetalLibraryObject:
 
     def __init__(self, global_constants: constants.Constants,
                  host_build: str, host_version: str,
-                 ignore_installed: bool = False, passive: bool = False
+                 ignore_installed: bool = False, passive: bool = False,
+                 metallib_install_path: Optional[Union[str, Path]] = None,
+                 offline_assets_dir: Optional[Union[str, Path]] = None,
+                 target_volume: Optional[Union[str, Path]] = None,
         ) -> None:
 
         self.constants: constants.Constants = global_constants
@@ -37,7 +43,17 @@ class MetalLibraryObject:
         self.passive: bool = passive  # Don't perform actions requiring elevated privileges
 
         self.ignore_installed:      bool = ignore_installed   # If True, will ignore any installed MetallibSupportPkg PKGs and download the latest
+        self.metallib_install_path: Path = Path(metallib_install_path) if metallib_install_path else Path(METALLIB_INSTALL_PATH)
+        self.target_volume:         Path = Path(target_volume) if target_volume else Path("/")
+
+        constants_offline = getattr(global_constants, "offline_assets_dir", None)
+        resolved_offline = offline_assets_dir if offline_assets_dir is not None else constants_offline
+        self.offline_assets_dir: Optional[Path] = Path(resolved_offline) if resolved_offline else None
+
         self.metallib_already_installed: bool = False
+        self.metallib_available_offline: bool = False
+        self.metallib_offline_asset_path: str = ""
+        self.metallib_offline_asset_type: str = ""
 
         self.metallib_installed_path: str = ""
 
@@ -56,6 +72,98 @@ class MetalLibraryObject:
         self.error_msg: str = ""
 
         self._get_latest_metallib()
+
+
+    @property
+    def metallib_available(self) -> bool:
+        return bool(self.metallib_already_installed or self.metallib_available_offline)
+
+
+    def _offline_search_dirs(self) -> list[Path]:
+        if not self.offline_assets_dir:
+            return []
+        candidates = [
+            self.offline_assets_dir,
+            self.offline_assets_dir / "MetallibSupportPkg",
+            self.offline_assets_dir / "assets",
+        ]
+        return [d for d in candidates if d.is_dir()]
+
+
+    @staticmethod
+    def _read_metallib_info_plist(directory: Path) -> Optional[dict]:
+        info_path = directory / METALLIB_INFO_PLIST
+        if not info_path.is_file():
+            return None
+        try:
+            with info_path.open("rb") as f:
+                return plistlib.load(f)
+        except Exception:
+            return None
+
+
+    def _find_offline_metallib(self, match: Optional[str] = None, check_version: bool = False, allow_generic: bool = False) -> Optional[tuple[Path, str]]:
+        if self.ignore_installed is True:
+            return None
+        search_dirs = self._offline_search_dirs()
+        if not search_dirs:
+            return None
+
+        target_match = match or (self.host_version if check_version else self.host_build)
+
+        for search_dir in search_dirs:
+            for item in sorted(search_dir.iterdir()):
+                if not item.is_dir():
+                    continue
+                if check_version:
+                    if target_match not in item.name:
+                        continue
+                else:
+                    if not item.name.endswith(f"-{target_match}"):
+                        continue
+                if any(item.rglob("*.metallib")):
+                    return (item, "dir")
+
+        for search_dir in search_dirs:
+            info = self._read_metallib_info_plist(search_dir)
+            for item in sorted(search_dir.iterdir()):
+                if item.is_dir() or not item.name.endswith(".pkg"):
+                    continue
+                if "metallib" not in item.name.lower():
+                    continue
+                if check_version:
+                    if target_match in item.name:
+                        return (item, "pkg")
+                    if info and target_match in str(info.get("version", "")):
+                        return (item, "pkg")
+                else:
+                    if target_match in item.name:
+                        return (item, "pkg")
+                    if info and info.get("build") == target_match:
+                        return (item, "pkg")
+
+        if allow_generic:
+            for search_dir in search_dirs:
+                candidate = search_dir / "MetallibSupportPkg.pkg"
+                if candidate.is_file():
+                    return (candidate, "pkg")
+
+        return None
+
+
+    def _apply_offline_metallib_match(self, asset_path: Path, asset_type: str) -> None:
+        if asset_type == "dir":
+            logging.info(f"Found offline metallib directory: {asset_path}")
+            self.metallib_installed_path = str(asset_path)
+            self.metallib_already_installed = True
+            self.success = True
+            return
+
+        logging.info(f"Found offline metallib pkg: {asset_path}")
+        self.metallib_offline_asset_path = str(asset_path)
+        self.metallib_offline_asset_type = asset_type
+        self.metallib_available_offline = True
+        self.success = True
 
 
     def _get_remote_metallibs(self) -> dict:
@@ -109,6 +217,18 @@ class MetalLibraryObject:
             self.success = True
             return
 
+        offline_exact = self._find_offline_metallib(match=self.host_build, check_version=False, allow_generic=False)
+        if offline_exact:
+            self._apply_offline_metallib_match(*offline_exact)
+            return
+
+        if self.offline_assets_dir is not None:
+            loose_version = f"{parsed_version.major}.{parsed_version.minor}"
+            offline_loose = self._find_offline_metallib(match=loose_version, check_version=True, allow_generic=True)
+            if offline_loose:
+                self._apply_offline_metallib_match(*offline_loose)
+                return
+
         remote_metallib_version = self._get_remote_metallibs()
 
         if remote_metallib_version is None:
@@ -132,6 +252,11 @@ class MetalLibraryObject:
                 logging.info(f"Found matching metallib: {Path(self.metallib_installed_path).name}")
                 self.metallib_already_installed = True
                 self.success = True
+                return
+
+            offline_fallback = self._find_offline_metallib(match=older_version, check_version=True, allow_generic=True)
+            if offline_fallback:
+                self._apply_offline_metallib_match(*offline_fallback)
                 return
 
             logging.warning(f"Couldn't find metallib matching {self.host_version} or {older_version}, please install one manually")
@@ -208,10 +333,13 @@ class MetalLibraryObject:
         if self.ignore_installed:
             return None
 
-        if not Path(METALLIB_INSTALL_PATH).exists():
+        if match is None:
+            match = self.host_version if check_version else self.host_build
+
+        if not self.metallib_install_path.exists():
             return None
 
-        for metallib_folder in Path(METALLIB_INSTALL_PATH).iterdir():
+        for metallib_folder in self.metallib_install_path.iterdir():
             if not metallib_folder.is_dir():
                 continue
             if check_version:
@@ -251,12 +379,74 @@ class MetalLibraryObject:
         return network_handler.DownloadObject(self.metallib_url, metallib_download_path)
 
 
-    def install_metallib(self, metallib: str = None) -> None:
+    def _extract_metallib_pkg_offline(self, pkg_path: Path, dest_dir: Path) -> bool:
+        """
+        Extract MetallibSupportPkg.pkg directly into `<target_data>/Library/Application Support/Dortania/MetallibSupportPkg`
+        using a staging folder on `dest_dir`.
+        """
+        subprocess_wrapper.run_as_root(["/bin/mkdir", "-p", str(dest_dir)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        stage_dir = dest_dir / f".ocpbp_metallib_stage_{os.getpid()}"
+        if stage_dir.exists():
+            subprocess_wrapper.run_as_root(["/bin/rm", "-rf", str(stage_dir)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+        expanded_dir = stage_dir / "expanded"
+        try:
+            result = subprocess_wrapper.run_as_root(
+                ["/usr/sbin/pkgutil", "--expand-full", str(pkg_path), str(expanded_dir)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            if result.returncode != 0:
+                logging.warning("pkgutil --expand-full failed for offline MetallibSupportPkg")
+                subprocess_wrapper.log(result)
+                return False
+
+            installed_dirs: list[Path] = []
+            for payload_root in expanded_dir.rglob("MetallibSupportPkg"):
+                if payload_root.is_dir():
+                    for child in payload_root.iterdir():
+                        if child.is_dir():
+                            installed_dirs.append(child)
+
+            if not installed_dirs:
+                for candidate in expanded_dir.rglob("*"):
+                    if candidate.is_dir() and any(candidate.glob("System")) and candidate.name != "Payload":
+                        installed_dirs.append(candidate)
+
+            if not installed_dirs:
+                logging.warning(f"No MetallibSupportPkg directories found inside expanded package: {pkg_path}")
+                return False
+
+            for src_dir in installed_dirs:
+                dst_subdir = dest_dir / src_dir.name
+                if dst_subdir.exists():
+                    subprocess_wrapper.run_as_root(["/bin/rm", "-rf", str(dst_subdir)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                move_res = subprocess_wrapper.run_as_root(
+                    ["/bin/mv", str(src_dir), str(dst_subdir)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+                if move_res.returncode != 0:
+                    subprocess_wrapper.log(move_res)
+                    return False
+
+            return True
+        finally:
+            if stage_dir.exists():
+                subprocess_wrapper.run_as_root(["/bin/rm", "-rf", str(stage_dir)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+
+    def install_metallib(
+        self,
+        metallib: Optional[Union[str, Path]] = None,
+        target_volume: Optional[Union[str, Path]] = None,
+        metallib_install_path: Optional[Union[str, Path]] = None,
+    ) -> bool:
         """
         Install MetallibSupportPkg PKG
         """
 
-        if not self.success:
+        if not self.success and not metallib:
             logging.error("Cannot install metallib, no metallib was successfully retrieved")
             return False
 
@@ -264,8 +454,22 @@ class MetalLibraryObject:
             logging.info("No installation required, metallib already installed")
             return True
 
+        pkg_path = Path(metallib or self.metallib_offline_asset_path or self.constants.metallib_download_path)
+        resolved_target = str(target_volume or self.target_volume or "/")
+        resolved_install_dir = Path(metallib_install_path) if metallib_install_path else (
+            Path(resolved_target) / "Library/Application Support/Dortania/MetallibSupportPkg"
+            if resolved_target != "/"
+            else self.metallib_install_path
+        )
+
+        if resolved_install_dir != Path(METALLIB_INSTALL_PATH) or resolved_target != "/":
+            if self._extract_metallib_pkg_offline(pkg_path, resolved_install_dir):
+                return True
+            if resolved_target == "/":
+                return False
+
         result = subprocess_wrapper.run_as_root([
-            "/usr/sbin/installer", "-pkg", metallib if metallib else self.constants.metallib_download_path, "-target", "/"
+            "/usr/sbin/installer", "-pkg", pkg_path, "-target", resolved_target
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if result.returncode != 0:
             subprocess_wrapper.log(result)

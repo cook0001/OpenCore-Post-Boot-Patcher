@@ -11,6 +11,7 @@ import packaging.version
 from enum      import StrEnum
 from pathlib   import Path
 from functools import cache
+from typing    import Optional, Union
 
 from .hardware.base import BaseHardware, HardwareVariantGraphicsSubclass
 
@@ -60,7 +61,8 @@ from ...support import (
 )
 from ...detections import (
     amfi_detect,
-    device_probe
+    device_probe,
+    os_probe,
 )
 
 
@@ -98,15 +100,59 @@ class HardwarePatchsetDetection:
     def __init__(self, constants: constants.Constants,
                  xnu_major: int = None, xnu_minor:  int = None,
                  os_build:  str = None, os_version: str = None,
-                 validation: bool = False # Whether to run validation checks
+                 validation: bool = False, # Whether to run validation checks
+                 target_root: Optional[Union[str, Path]] = None,
+                 target_data: Optional[Union[str, Path]] = None,
+                 preboot_root: Optional[Union[str, Path]] = None,
+                 offline_assets_dir: Optional[Union[str, Path]] = None,
                  ) -> None:
         self._constants = constants
-
-        self._xnu_major  = xnu_major  or self._constants.detected_os
-        self._xnu_minor  = xnu_minor  or self._constants.detected_os_minor
-        self._os_build   = os_build   or self._constants.detected_os_build
-        self._os_version = os_version or self._constants.detected_os_version
         self._validation = validation
+
+        constants_offline = getattr(constants, "offline_assets_dir", None)
+        resolved_offline = offline_assets_dir if offline_assets_dir is not None else constants_offline
+        self._offline_assets_dir: Optional[Path] = Path(resolved_offline) if resolved_offline else None
+
+        self._target_volume_group = None
+        self._is_offline_target = False
+        self._target_root: Optional[Path] = None
+        self._target_data: Optional[Path] = Path(target_data) if target_data else None
+        self._preboot_root: Optional[Path] = Path(preboot_root) if preboot_root else None
+
+        self._resolve_offline_target(target_root, target_data, preboot_root)
+
+        self._xnu_major  = xnu_major
+        self._xnu_minor  = xnu_minor
+        self._os_build   = os_build
+        self._os_version = os_version
+
+        if self._is_offline_target and not self._validation and self._target_root:
+            sys_ver_plist = self._target_root / "System/Library/CoreServices/SystemVersion.plist"
+            if sys_ver_plist.is_file():
+                probe = os_probe.OSProbe(target_root=self._target_root, preboot_root=self._preboot_root)
+                if self._xnu_major is None:
+                    self._xnu_major = probe.detect_kernel_major()
+                if self._xnu_minor is None:
+                    self._xnu_minor = probe.detect_kernel_minor()
+                if self._os_build is None:
+                    self._os_build = probe.detect_os_build()
+                if self._os_version is None:
+                    self._os_version = probe.detect_os_version()
+
+        if self._xnu_major is None:
+            self._xnu_major = self._constants.detected_os
+        if self._xnu_minor is None:
+            self._xnu_minor = self._constants.detected_os_minor
+        if self._os_build is None:
+            self._os_build = self._constants.detected_os_build
+        if self._os_version is None:
+            self._os_version = self._constants.detected_os_version
+
+        if self._is_offline_target and not self._validation:
+            self._constants.detected_os = self._xnu_major
+            self._constants.detected_os_minor = self._xnu_minor
+            self._constants.detected_os_build = self._os_build
+            self._constants.detected_os_version = self._os_version
 
         self._hardware_variants = [
             intel_gma_x3100.IntelGMAX3100,
@@ -150,6 +196,52 @@ class HardwarePatchsetDetection:
         self._detect()
 
 
+    def _resolve_offline_target(
+        self,
+        target_root: Optional[Union[str, Path]],
+        target_data: Optional[Union[str, Path]],
+        preboot_root: Optional[Union[str, Path]],
+    ) -> None:
+        if self._validation:
+            return
+        effective_target = target_root if target_root is not None else getattr(self._constants, "target_vol", None)
+        if not effective_target or str(effective_target) in ("", "/"):
+            return
+
+        effective_path = Path(effective_target)
+        has_system_plist = (effective_path / "System/Library/CoreServices/SystemVersion.plist").is_file()
+
+        if effective_path.is_dir() and has_system_plist and self._target_data is not None:
+            self._is_offline_target = True
+            self._target_root = effective_path
+            return
+
+        from ..mount import APFSVolumeResolver
+        try:
+            group = APFSVolumeResolver().resolve_target(str(effective_target))
+        except RuntimeError:
+            if effective_path.is_dir() and has_system_plist:
+                self._is_offline_target = True
+                self._target_root = effective_path
+                if self._target_data is None:
+                    self._target_data = effective_path
+                return
+            raise
+
+        if group.is_live_booted:
+            self._is_offline_target = False
+            self._target_root = Path("/")
+            return
+
+        self._is_offline_target = True
+        self._target_volume_group = group
+        self._target_root = Path(group.system_mount) if group.system_mount else effective_path
+        if self._target_data is None and group.data_mount:
+            self._target_data = Path(group.data_mount)
+        if self._preboot_root is None and group.preboot_mount:
+            self._preboot_root = Path(group.preboot_mount)
+
+
     def _validation_check_unsupported_host_os(self) -> bool:
         """
         Determine if host OS is unsupported
@@ -186,14 +278,20 @@ class HardwarePatchsetDetection:
             if "-allow_fv" in nvram:
                 return False
 
+        if self._is_offline_target:
+            if self._target_volume_group is not None:
+                return bool(self._target_volume_group.filevault_enabled)
+            return False
+
         return "FileVault is Off" not in subprocess.run(["/usr/bin/fdesetup", "status"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout.decode()
 
-    
+
     def _validation_check_repatching_not_possible(self, present_hardware: list[BaseHardware]) -> bool:
         """
         Determine if repatching is not allowed
         """
-        oclp_patch_path = Path("/System/Library/CoreServices/OpenCore-Legacy-Patcher.plist")
+        root_base = self._target_root if (self._is_offline_target and self._target_root) else Path("/")
+        oclp_patch_path = root_base / "System/Library/CoreServices/OpenCore-Legacy-Patcher.plist"
         try:
             with oclp_patch_path.open("rb") as patch_file:
                 oclp_plist = plistlib.load(patch_file)
@@ -312,12 +410,14 @@ class HardwarePatchsetDetection:
         """
         Check if network patches are already applied
         """
-        oclp_patch_path = "/System/Library/CoreServices/OpenCore-Legacy-Patcher.plist"
-        if not Path(oclp_patch_path).exists():
+        root_base = self._target_root if (self._is_offline_target and self._target_root) else Path("/")
+        oclp_patch_path = root_base / "System/Library/CoreServices/OpenCore-Legacy-Patcher.plist"
+        if not oclp_patch_path.exists():
             return False
         try:
-            oclp_plist = plistlib.load(open(oclp_patch_path, "rb"))
-        except Exception as e:
+            with oclp_patch_path.open("rb") as f:
+                oclp_plist = plistlib.load(f)
+        except Exception:
             return False
         if "Legacy Wireless" in oclp_plist or "Modern Wireless" in oclp_plist:
             return True
@@ -328,14 +428,40 @@ class HardwarePatchsetDetection:
         """
         Check if Kernel Debug Kit is present
         """
-        return kdk_handler.KernelDebugKitObject(self._constants, self._os_build, self._os_version, passive=True).kdk_already_installed
+        kdk_install_dir = (self._target_data / "Library/Developer/KDKs") if (self._is_offline_target and self._target_data) else None
+        target_vol = self._target_data if (self._is_offline_target and self._target_data) else None
+        kdk_obj = kdk_handler.KernelDebugKitObject(
+            self._constants,
+            self._os_build,
+            self._os_version,
+            passive=True,
+            kdk_install_path=kdk_install_dir,
+            offline_assets_dir=self._offline_assets_dir,
+            target_volume=target_vol,
+        )
+        if self._is_offline_target or self._offline_assets_dir:
+            return kdk_obj.kdk_available
+        return bool(kdk_obj.kdk_already_installed)
 
 
     def _is_cached_metallib_support_pkg_present(self) -> bool:
         """
         Check if MetallibSupportPkg is present
         """
-        return metallib_handler.MetalLibraryObject(self._constants, self._os_build, self._os_version).metallib_already_installed
+        metallib_install_dir = (self._target_data / "Library/Application Support/Dortania/MetallibSupportPkg") if (self._is_offline_target and self._target_data) else None
+        target_vol = self._target_data if (self._is_offline_target and self._target_data) else None
+        metallib_obj = metallib_handler.MetalLibraryObject(
+            self._constants,
+            self._os_build,
+            self._os_version,
+            passive=True,
+            metallib_install_path=metallib_install_dir,
+            offline_assets_dir=self._offline_assets_dir,
+            target_volume=target_vol,
+        )
+        if self._is_offline_target or self._offline_assets_dir:
+            return metallib_obj.metallib_available
+        return bool(metallib_obj.metallib_already_installed)
 
 
     def _can_patch(self, requirements: dict, ignore_keys: list[str] = []) -> bool:

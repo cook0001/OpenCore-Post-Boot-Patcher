@@ -37,10 +37,13 @@ This is because Apple removed on-disk binaries (ref: https://github.com/dortania
 
 import logging
 import plistlib
+import shutil
 import subprocess
+import tempfile
 
 from pathlib   import Path
 from functools import cache
+from typing    import Optional, Union
 
 from .mount import (
     RootVolumeMount,
@@ -59,6 +62,9 @@ from ..volume   import generate_copy_arguments
 
 from ..datasets import (
     os_data
+)
+from ..detections import (
+    os_probe
 )
 from ..support import (
     utilities,
@@ -79,10 +85,30 @@ from .auto_patcher import InstallAutomaticPatchingServices
 
 
 class PatchSysVolume:
-    def __init__(self, model: str, global_constants: constants.Constants, hardware_details: list = None) -> None:
+    def __init__(
+        self,
+        model: str,
+        global_constants: constants.Constants,
+        hardware_details: list = None,
+        target_vol: Optional[Union[str, Path]] = None,
+        offline_assets_dir: Optional[Union[str, Path]] = None,
+        passphrase: Optional[str] = None,
+        interactive_unlock: bool = False,
+    ) -> None:
         self.model = model
         self.constants: constants.Constants = global_constants
         self.computer = self.constants.computer
+
+        constants_target = getattr(global_constants, "target_vol", None)
+        self.target_vol: Optional[str] = (
+            str(target_vol) if target_vol is not None else (str(constants_target) if constants_target else None)
+        )
+        constants_offline = getattr(global_constants, "offline_assets_dir", None)
+        resolved_offline = offline_assets_dir if offline_assets_dir is not None else constants_offline
+        self.offline_assets_dir: Optional[Path] = Path(resolved_offline) if resolved_offline else None
+        self.passphrase: Optional[str] = passphrase
+        self.interactive_unlock: bool = interactive_unlock
+
         self.root_supports_snapshot = utilities.check_if_root_is_apfs_snapshot()
         self.constants.root_patcher_succeeded = False # Reset Variable each time we start
         self.constants.needs_to_open_preferences = False
@@ -91,28 +117,105 @@ class PatchSysVolume:
         self.kdk_path = None
         self.metallib_path = None
 
-        if hardware_details is None:
-            hardware_details = HardwarePatchsetDetection(self.constants).device_properties
-        self.hardware_details = hardware_details
+        self._target_os = self.constants.detected_os
+        self._target_os_minor = self.constants.detected_os_minor
+        self._target_os_build = self.constants.detected_os_build
+        self._target_os_version = self.constants.detected_os_version
+        self._probed_target_os = False
+
+        self.mount_obj = RootVolumeMount(
+            self._target_os,
+            target_root=self.target_vol,
+            passphrase=self.passphrase,
+            interactive_unlock=self.interactive_unlock,
+        )
+        self.is_offline_target: bool = self.mount_obj.is_offline_target
+
+        if self.is_offline_target:
+            initial_sys = self.mount_obj.volume_group.system_mount if self.mount_obj.volume_group else self.target_vol
+            self._probed_target_os = self._sync_target_os_metadata(
+                target_root=initial_sys,
+                preboot_root=self.mount_obj.preboot_mount,
+            )
+            self.mount_obj.xnu_major = self._target_os
+            if self._target_os >= os_data.os_data.big_sur:
+                self.root_supports_snapshot = True
+
         self._init_pathing()
 
-        self.skip_root_kmutil_requirement = not self.hardware_details[HardwarePatchsetSettings.KERNEL_DEBUG_KIT_REQUIRED] if self.constants.detected_os >= os_data.os_data.ventura else False
+        if hardware_details is None:
+            hardware_details = self._detect_hardware_details().device_properties
+        self.hardware_details = hardware_details
+        self._refresh_target_flags()
 
-        self.requires_kdk_caching      = self.hardware_details[HardwarePatchsetSettings.KERNEL_DEBUG_KIT_REQUIRED] and self.constants.detected_os >= os_data.os_data.ventura
-        self.requires_metallib_caching = self.hardware_details[HardwarePatchsetSettings.METALLIB_SUPPORT_PKG_REQUIRED] and self.constants.detected_os >= os_data.os_data.sequoia
 
-        self.mount_obj = RootVolumeMount(self.constants.detected_os)
+    def _sync_target_os_metadata(
+        self,
+        target_root: Optional[Union[str, Path]],
+        preboot_root: Optional[Union[str, Path]] = None,
+    ) -> bool:
+        if not target_root or str(target_root) in ("", "/"):
+            return False
+        sys_ver_plist = Path(target_root) / "System/Library/CoreServices/SystemVersion.plist"
+        if not sys_ver_plist.is_file():
+            return False
+
+        probe = os_probe.OSProbe(target_root=target_root, preboot_root=preboot_root)
+        self._target_os = probe.detect_kernel_major()
+        self._target_os_minor = probe.detect_kernel_minor()
+        self._target_os_build = probe.detect_os_build()
+        self._target_os_version = probe.detect_os_version()
+
+        self.constants.detected_os = self._target_os
+        self.constants.detected_os_minor = self._target_os_minor
+        self.constants.detected_os_build = self._target_os_build
+        self.constants.detected_os_version = self._target_os_version
+        return True
+
+
+    def _refresh_target_flags(self) -> None:
+        self.skip_root_kmutil_requirement = (
+            not self.hardware_details[HardwarePatchsetSettings.KERNEL_DEBUG_KIT_REQUIRED]
+            if self._target_os >= os_data.os_data.ventura
+            else False
+        )
+        self.requires_kdk_caching = (
+            self.hardware_details[HardwarePatchsetSettings.KERNEL_DEBUG_KIT_REQUIRED]
+            and self._target_os >= os_data.os_data.ventura
+        )
+        self.requires_metallib_caching = (
+            self.hardware_details[HardwarePatchsetSettings.METALLIB_SUPPORT_PKG_REQUIRED]
+            and self._target_os >= os_data.os_data.sequoia
+        )
+
+
+    def _detect_hardware_details(self) -> HardwarePatchsetDetection:
+        return HardwarePatchsetDetection(
+            self.constants,
+            xnu_major=self._target_os,
+            xnu_minor=self._target_os_minor,
+            os_build=self._target_os_build,
+            os_version=self._target_os_version,
+            target_root=(self.mount_location or self.target_vol) if self.is_offline_target else None,
+            target_data=self.mount_location_data if (self.is_offline_target and self.mount_location_data) else None,
+            preboot_root=self.mount_obj.preboot_mount if self.is_offline_target else None,
+            offline_assets_dir=self.offline_assets_dir,
+        )
 
 
     def _init_pathing(self) -> None:
         """
         Initializes the pathing for root volume patching
         """
-        self.mount_location_data = ""
-        if self.root_supports_snapshot is True:
-            self.mount_location = "/System/Volumes/Update/mnt1"
+        if self.is_offline_target:
+            self.mount_location_data = str(self.mount_obj.data_mount or "")
+            self.mount_location = str((self.mount_obj.volume_group.system_mount if self.mount_obj.volume_group else None) or "")
         else:
-            self.mount_location = ""
+            self.mount_location_data = ""
+            if self.root_supports_snapshot is True:
+                self.mount_location = "/System/Volumes/Update/mnt1"
+            else:
+                self.mount_location = ""
 
         self.mount_extensions = f"{self.mount_location}/System/Library/Extensions"
         self.mount_application_support = f"{self.mount_location_data}/Library/Application Support"
@@ -122,7 +225,13 @@ class PatchSysVolume:
         """
         Mount root volume
         """
-        if self.mount_obj.mount():
+        mounted_path = self.mount_obj.mount()
+        if mounted_path:
+            if self.is_offline_target:
+                self.mount_location = str(mounted_path)
+                self.mount_location_data = str(self.mount_obj.data_mount or "")
+                self.mount_extensions = f"{self.mount_location}/System/Library/Extensions"
+                self.mount_application_support = f"{self.mount_location_data}/Library/Application Support"
             return True
 
         return False
@@ -149,14 +258,15 @@ class PatchSysVolume:
             return False
 
         try:
-            mounted_data = plistlib.load(open(mounted_system_version, "rb"))
-            if mounted_data["ProductBuildVersion"] != self.constants.detected_os_build:
+            with open(mounted_system_version, "rb") as f:
+                mounted_data = plistlib.load(f)
+            if mounted_data["ProductBuildVersion"] != self._target_os_build:
                 logging.error(
-                    f"- SystemVersion.plist build version mismatch: found {mounted_data['ProductVersion']} ({mounted_data['ProductBuildVersion']}), expected {self.constants.detected_os_version} ({self.constants.detected_os_build})"
+                    f"- SystemVersion.plist build version mismatch: found {mounted_data['ProductVersion']} ({mounted_data['ProductBuildVersion']}), expected {self._target_os_version} ({self._target_os_build})"
                     )
                 logging.error("An update is in progress on your machine and patching cannot continue until it is cancelled or finished")
                 return False
-        except:
+        except Exception:
             logging.error("- Failed to parse SystemVersion.plist")
             return False
 
@@ -175,7 +285,12 @@ class PatchSysVolume:
         self.kdk_path = KernelDebugKitMerge(
             self.constants,
             self.mount_location,
-            self.skip_root_kmutil_requirement
+            self.skip_root_kmutil_requirement,
+            target_data_mount=self.mount_location_data,
+            target_os_build=self._target_os_build,
+            target_os_version=self._target_os_version,
+            target_os_major=self._target_os,
+            offline_assets_dir=self.offline_assets_dir,
         ).merge(save_hid_cs)
 
 
@@ -184,7 +299,9 @@ class PatchSysVolume:
         Reverts APFS snapshot and cleans up any changes made to the root and data volume
         """
 
-        if APFSSnapshot(self.constants.detected_os, self.mount_location).revert_snapshot() is False:
+        if APFSSnapshot(self._target_os, self.mount_location).revert_snapshot() is False:
+            if self.is_offline_target:
+                self._unmount_root_vol()
             return
 
         self._clean_skylight_plugins()
@@ -193,9 +310,13 @@ class PatchSysVolume:
 
         kernelcache.KernelCacheSupport(
             mount_location_data=self.mount_location_data,
-            detected_os=self.constants.detected_os,
-            skip_root_kmutil_requirement=self.skip_root_kmutil_requirement
+            detected_os=self._target_os,
+            skip_root_kmutil_requirement=self.skip_root_kmutil_requirement,
+            mount_location=self.mount_location,
         ).clean_auxiliary_kc()
+
+        if self.is_offline_target:
+            self._unmount_root_vol()
 
         self.constants.root_patcher_succeeded = True
         logging.info("- Unpatching complete")
@@ -240,18 +361,22 @@ class PatchSysVolume:
         Rebuilds the Kernel Cache
         """
 
-        result =  kernelcache.RebuildKernelCache(
-            os_version=self.constants.detected_os,
+        result = kernelcache.RebuildKernelCache(
+            os_version=self._target_os,
             mount_location=self.mount_location,
             auxiliary_cache=self.needs_kmutil_exemptions,
-            auxiliary_cache_only=self.skip_root_kmutil_requirement
+            auxiliary_cache_only=self.skip_root_kmutil_requirement,
+            mount_location_data=self.mount_location_data,
         ).rebuild()
 
         if result is False:
             return False
 
         if self.skip_root_kmutil_requirement is False:
-            sys_patch_helpers.SysPatchHelpers(self.constants).install_rsr_repair_binary()
+            sys_patch_helpers.SysPatchHelpers(self.constants).install_rsr_repair_binary(
+                mount_location=self.mount_location if self.is_offline_target else None,
+                detected_os=self._target_os,
+            )
 
         return True
 
@@ -263,7 +388,7 @@ class PatchSysVolume:
         Returns:
             bool: True if snapshot was created, False if not
         """
-        return APFSSnapshot(self.constants.detected_os, self.mount_location).create_snapshot()
+        return APFSSnapshot(self._target_os, self.mount_location).create_snapshot()
 
 
     def _rebuild_dyld_shared_cache(self) -> None:
@@ -272,7 +397,7 @@ class PatchSysVolume:
         Only required on Mojave and older
         """
 
-        if self.constants.detected_os > os_data.os_data.catalina:
+        if self._target_os > os_data.os_data.catalina:
             return
         logging.info("- Rebuilding dyld shared cache")
         subprocess_wrapper.run_as_root_and_verify(["/usr/bin/update_dyld_shared_cache", "-root", f"{self.mount_location}/"])
@@ -284,7 +409,7 @@ class PatchSysVolume:
         Only required on Catalina
         """
 
-        if self.constants.detected_os == os_data.os_data.catalina:
+        if self._target_os == os_data.os_data.catalina:
             logging.info("- Rebuilding preboot kernel cache")
             subprocess_wrapper.run_as_root_and_verify(["/usr/sbin/kcditto"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
@@ -304,12 +429,19 @@ class PatchSysVolume:
         Remove defaults related to forced OpenGL rendering
         Primarily for development purposes
         """
+        domain = (
+            str(Path(self.mount_location_data) / "Library/Preferences/com.apple.CoreDisplay")
+            if (self.is_offline_target and self.mount_location_data)
+            else "/Library/Preferences/com.apple.CoreDisplay"
+        )
+        if self.is_offline_target and not Path(f"{domain}.plist").exists():
+            return
 
         for arg in ["useMetal", "useIOP"]:
-            result = subprocess.run(["/usr/bin/defaults", "read", "/Library/Preferences/com.apple.CoreDisplay", arg], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout.decode("utf-8").strip()
+            result = subprocess.run(["/usr/bin/defaults", "read", domain, arg], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout.decode("utf-8").strip()
             if result in ["0", "false", "1", "true"]:
                 logging.info(f"- Removing non-Metal Enforcement Preference: {arg}")
-                subprocess_wrapper.run_as_root(["/usr/bin/defaults", "delete", "/Library/Preferences/com.apple.CoreDisplay", arg])
+                subprocess_wrapper.run_as_root(["/usr/bin/defaults", "delete", domain, arg])
 
 
     def _delete_nonmetal_defaults(self) -> None:
@@ -322,7 +454,11 @@ class PatchSysVolume:
             "Moraea_ColorWidgetDisabled",
             "Moraea_BacklightHack",
         ]
-        system_domain = "/Library/Preferences/.GlobalPreferences.plist"
+        system_domain = (
+            str(Path(self.mount_location_data) / "Library/Preferences/.GlobalPreferences.plist")
+            if (self.is_offline_target and self.mount_location_data)
+            else "/Library/Preferences/.GlobalPreferences.plist"
+        )
         domains = {
             system_domain: skylight_defaults + [
                 "ShowDate",
@@ -332,9 +468,13 @@ class PatchSysVolume:
                 "NSEnableAppKitMenus",
                 "NSZoomButtonShowMenu",
             ],
-            "-globalDomain": skylight_defaults,
         }
+        if not self.is_offline_target:
+            domains["-globalDomain"] = skylight_defaults
+
         for domain, keys in domains.items():
+            if self.is_offline_target and not Path(domain).exists():
+                continue
             for key in keys:
                 result = subprocess.run(["/usr/bin/defaults", "read", domain, key], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
                 if result.returncode != 0:
@@ -358,11 +498,29 @@ class PatchSysVolume:
         destination_path = f"{self.mount_location}/System/Library/CoreServices"
         file_name = "OpenCore-Legacy-Patcher.plist"
         destination_path_file = f"{destination_path}/{file_name}"
-        if sys_patch_helpers.SysPatchHelpers(self.constants).generate_patchset_plist(patchset, file_name, self.kdk_path, self.metallib_path):
-            logging.info("- Writing patchset information to Root Volume")
-            if Path(destination_path_file).exists():
-                subprocess_wrapper.run_as_root_and_verify(["/bin/rm", destination_path_file], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            subprocess_wrapper.run_as_root_and_verify(generate_copy_arguments(f"{self.constants.payload_path}/{file_name}", destination_path), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        helper = sys_patch_helpers.SysPatchHelpers(self.constants)
+        temp_output_dir = tempfile.mkdtemp(prefix="ocpbp_plist_") if self.is_offline_target else None
+        try:
+            if helper.generate_patchset_plist(
+                patchset,
+                file_name,
+                self.kdk_path,
+                self.metallib_path,
+                output_dir=temp_output_dir,
+                detected_os=self._target_os,
+                detected_os_minor=self._target_os_minor,
+                detected_os_build=self._target_os_build,
+            ):
+                logging.info("- Writing patchset information to Root Volume")
+                if Path(destination_path_file).exists():
+                    subprocess_wrapper.run_as_root_and_verify(["/bin/rm", destination_path_file], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                src_plist = helper.last_generated_plist_path or (Path(self.constants.payload_path) / file_name)
+                subprocess_wrapper.run_as_root_and_verify(generate_copy_arguments(str(src_plist), destination_path), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        finally:
+            if temp_output_dir:
+                shutil.rmtree(temp_output_dir, ignore_errors=True)
+            elif helper.last_generated_plist_path and helper.last_generated_plist_path.parent.name.startswith("ocpbp_plist_"):
+                shutil.rmtree(helper.last_generated_plist_path.parent, ignore_errors=True)
 
 
     def _patch_root_vol(self):
@@ -374,15 +532,21 @@ class PatchSysVolume:
         if self.patch_set_dictionary != {}:
             self._execute_patchset(self.patch_set_dictionary)
         else:
-            self._execute_patchset(HardwarePatchsetDetection(self.constants).patches)
+            self._execute_patchset(self._detect_hardware_details().patches)
 
-        if self.constants.wxpython_variant is True and self.constants.detected_os >= os_data.os_data.big_sur:
+        if (self.constants.wxpython_variant is True or self.is_offline_target) and self._target_os >= os_data.os_data.big_sur:
             needs_daemon = False
             if self.requires_kdk_caching is True or self.requires_metallib_caching is True:
                 needs_daemon = True
-            InstallAutomaticPatchingServices(self.constants).install_auto_patcher_launch_agent(kdk_caching_needed=needs_daemon)
+            InstallAutomaticPatchingServices(
+                self.constants,
+                target_data_mount=self.mount_location_data if self.is_offline_target else None,
+                preboot_mount=self.mount_obj.preboot_mount if self.is_offline_target else None,
+                offline_assets_dir=self.offline_assets_dir,
+            ).install_auto_patcher_launch_agent(kdk_caching_needed=needs_daemon)
 
-        self._rebuild_root_volume()
+        if self._rebuild_root_volume() is False and self.is_offline_target:
+            self._unmount_root_vol()
 
 
     def _execute_patchset(self, required_patches: dict):
@@ -395,12 +559,15 @@ class PatchSysVolume:
 
         kc_support_obj = kernelcache.KernelCacheSupport(
             mount_location_data=self.mount_location_data,
-            detected_os=self.constants.detected_os,
-            skip_root_kmutil_requirement=self.skip_root_kmutil_requirement
+            detected_os=self._target_os,
+            skip_root_kmutil_requirement=self.skip_root_kmutil_requirement,
+            mount_location=self.mount_location,
         )
 
         source_files_path = str(self.constants.payload_local_binaries_root_path)
         required_patches = self._preflight_checks(required_patches, source_files_path)
+        helpers = sys_patch_helpers.SysPatchHelpers(self.constants)
+
         for patch in required_patches:
             logging.info("- Installing Patchset: " + patch)
             for method_remove in [PatchType.REMOVE_SYSTEM_VOLUME, PatchType.REMOVE_DATA_VOLUME]:
@@ -451,23 +618,33 @@ class PatchSysVolume:
 
                             destination_folder_path = updated_destination_folder_path
 
+                        if self.is_offline_target and destination_folder_path.endswith("/Library/Extensions") and not Path(destination_folder_path).exists():
+                            subprocess_wrapper.run_as_root(["/bin/mkdir", "-p", destination_folder_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
                         install_new_file(source_folder_path, destination_folder_path, install_file, method_install)
 
             if PatchType.EXECUTE in required_patches[patch]:
                 for process in required_patches[patch][PatchType.EXECUTE]:
                     # Some processes need sudo, however we cannot directly call sudo in some scenarios
                     # Instead, call elevated funtion if string's boolean is True
-                    if required_patches[patch][PatchType.EXECUTE][process] is True:
-                        logging.info(f"- Running Process as Root:\n{process}")
-                        subprocess_wrapper.run_as_root_and_verify(process.split(" "), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                    else:
-                        logging.info(f"- Running Process:\n{process}")
-                        subprocess_wrapper.run_and_verify(process, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True)
+                    as_root = bool(required_patches[patch][PatchType.EXECUTE][process] is True)
+                    helpers.run_execute_command(
+                        process,
+                        as_root=as_root,
+                        target_data_mount=self.mount_location_data if self.is_offline_target else None,
+                    )
 
         if any(x in required_patches for x in ["AMD Legacy GCN", "AMD Legacy Polaris", "AMD Legacy Vega"]):
-            sys_patch_helpers.SysPatchHelpers(self.constants).disable_window_server_caching()
+            helpers.disable_window_server_caching(
+                target_data_mount=self.mount_location_data if self.is_offline_target else None,
+                detected_os=self._target_os,
+            )
         if "Metal 3802 Common Extended" in required_patches:
-            sys_patch_helpers.SysPatchHelpers(self.constants).patch_gpu_compiler_libraries(mount_point=self.mount_location)
+            helpers.patch_gpu_compiler_libraries(
+                mount_point=self.mount_location,
+                detected_os=self._target_os,
+                detected_os_minor=self._target_os_minor,
+            )
 
         self._write_patchset(required_patches)
 
@@ -476,14 +653,53 @@ class PatchSysVolume:
         """
         Resolves MetalLibSupportPkg
         """
-        metallib_obj = metallib_handler.MetalLibraryObject(self.constants, self.constants.detected_os_build, self.constants.detected_os_version)
+        metallib_install_dir = (
+            Path(self.mount_location_data) / "Library/Application Support/Dortania/MetallibSupportPkg"
+            if (self.is_offline_target and self.mount_location_data)
+            else None
+        )
+        target_vol = self.mount_location_data if (self.is_offline_target and self.mount_location_data) else None
+
+        metallib_obj = metallib_handler.MetalLibraryObject(
+            self.constants,
+            self._target_os_build,
+            self._target_os_version,
+            metallib_install_path=metallib_install_dir,
+            offline_assets_dir=self.offline_assets_dir,
+            target_volume=target_vol,
+        )
         if metallib_obj.success is False:
             logging.error(f"Failed to find MetalLibSupportPkg: {metallib_obj.error_msg}")
             raise Exception(f"Failed to find MetalLibSupportPkg: {metallib_obj.error_msg}")
 
+        if metallib_obj.metallib_already_installed:
+            logging.info(f"Using MetalLibSupportPkg: {metallib_obj.metallib_installed_path}")
+            self.metallib_path = metallib_obj.metallib_installed_path
+            return str(metallib_obj.metallib_installed_path)
+
+        if metallib_obj.metallib_available_offline:
+            if metallib_obj.install_metallib(target_volume=target_vol, metallib_install_path=metallib_install_dir) is False:
+                logging.error("Failed to install offline MetalLibSupportPkg")
+                raise Exception("Failed to install offline MetalLibSupportPkg")
+
+            refreshed = metallib_handler.MetalLibraryObject(
+                self.constants,
+                self._target_os_build,
+                self._target_os_version,
+                passive=True,
+                metallib_install_path=metallib_install_dir,
+                offline_assets_dir=self.offline_assets_dir,
+                target_volume=target_vol,
+            )
+            if refreshed.metallib_already_installed and refreshed.metallib_installed_path:
+                logging.info(f"Using MetalLibSupportPkg: {refreshed.metallib_installed_path}")
+                self.metallib_path = refreshed.metallib_installed_path
+                return str(refreshed.metallib_installed_path)
+            logging.error("Offline MetalLibSupportPkg failed validation after extraction")
+            raise Exception("Offline MetalLibSupportPkg failed validation after extraction")
+
         metallib_download_obj = metallib_obj.retrieve_download()
         if not metallib_download_obj:
-            # Already downloaded, return path
             logging.info(f"Using MetalLibSupportPkg: {metallib_obj.metallib_installed_path}")
             self.metallib_path = metallib_obj.metallib_installed_path
             return str(metallib_obj.metallib_installed_path)
@@ -494,7 +710,7 @@ class PatchSysVolume:
             logging.error(f"Could not download MetalLibSupportPkg: {error_msg}")
             raise Exception(f"Could not download MetalLibSupportPkg: {error_msg}")
 
-        if metallib_obj.install_metallib() is False:
+        if metallib_obj.install_metallib(target_volume=target_vol, metallib_install_path=metallib_install_dir) is False:
             logging.error("Failed to install MetalLibSupportPkg")
             raise Exception("Failed to install MetalLibSupportPkg")
 
@@ -558,8 +774,9 @@ class PatchSysVolume:
         # Make sure we clean old kexts in /L*/E* that are not in the patchset
         kernelcache.KernelCacheSupport(
             mount_location_data=self.mount_location_data,
-            detected_os=self.constants.detected_os,
-            skip_root_kmutil_requirement=self.skip_root_kmutil_requirement
+            detected_os=self._target_os,
+            skip_root_kmutil_requirement=self.skip_root_kmutil_requirement,
+            mount_location=self.mount_location,
         ).clean_auxiliary_kc()
 
         # Make sure SNB kexts are compatible with the host
@@ -581,36 +798,64 @@ class PatchSysVolume:
         """
 
         logging.info("- Starting Patch Process")
-        logging.info(f"- Determining Required Patch set for Darwin {self.constants.detected_os}")
-        patchset_obj = HardwarePatchsetDetection(self.constants)
+        logging.info(f"- Determining Required Patch set for Darwin {self._target_os}")
+        patchset_obj = self._detect_hardware_details()
         self.patch_set_dictionary = patchset_obj.patches
 
-        if self.patch_set_dictionary == {}:
+        if self.patch_set_dictionary == {} and (not self.is_offline_target or self._probed_target_os):
             logging.info("- No Root Patches required for your machine!")
             return
 
-        logging.info("- Verifying whether Root Patching possible")
-        if patchset_obj.can_patch is False:
-            logging.error("- Cannot continue with patching!!!")
-            patchset_obj.detailed_errors()
-            return
+        if not self.is_offline_target or self._probed_target_os:
+            logging.info("- Verifying whether Root Patching possible")
+            if patchset_obj.can_patch is False:
+                logging.error("- Cannot continue with patching!!!")
+                patchset_obj.detailed_errors()
+                return
 
         logging.info("- Patcher is capable of patching")
-        if PatcherSupportPkgMount(self.constants).mount() is False:
+        pkg_mount = PatcherSupportPkgMount(self.constants, offline_assets_dir=self.offline_assets_dir)
+        if pkg_mount.mount() is False:
             logging.error("- Critical resources missing, cannot continue with patching!!!")
             return
 
-        if self._mount_root_vol() is False:
-            logging.error("- Failed to mount root volume, cannot continue with patching!!!")
-            return
+        try:
+            if self._mount_root_vol() is False:
+                logging.error("- Failed to mount root volume, cannot continue with patching!!!")
+                return
 
-        if self._run_sanity_checks() is False:
-            self._unmount_root_vol()
-            logging.error("- Failed sanity checks, cannot continue with patching!!!")
-            logging.error("- Please ensure that you do not have any updates pending")
-            return
+            if self.is_offline_target and not self._probed_target_os:
+                self._probed_target_os = self._sync_target_os_metadata(
+                    target_root=self.mount_location,
+                    preboot_root=self.mount_obj.preboot_mount,
+                )
+                patchset_obj = self._detect_hardware_details()
+                self.hardware_details = patchset_obj.device_properties
+                self._refresh_target_flags()
+                self.patch_set_dictionary = patchset_obj.patches
 
-        self._patch_root_vol()
+                if self.patch_set_dictionary == {}:
+                    logging.info("- No Root Patches required for your machine!")
+                    self._unmount_root_vol()
+                    return
+                if patchset_obj.can_patch is False:
+                    logging.error("- Cannot continue with patching!!!")
+                    patchset_obj.detailed_errors()
+                    self._unmount_root_vol()
+                    return
+
+            if self._run_sanity_checks() is False:
+                self._unmount_root_vol()
+                logging.error("- Failed sanity checks, cannot continue with patching!!!")
+                logging.error("- Please ensure that you do not have any updates pending")
+                return
+
+            self._patch_root_vol()
+        finally:
+            if self.is_offline_target:
+                if not self.constants.root_patcher_succeeded:
+                    self._unmount_root_vol()
+                pkg_mount.unmount()
 
 
     def start_unpatch(self) -> None:
@@ -619,8 +864,8 @@ class PatchSysVolume:
         """
 
         logging.info("- Starting Unpatch Process")
-        patchset_obj = HardwarePatchsetDetection(self.constants)
-        if patchset_obj.can_unpatch is False:
+        patchset_obj = self._detect_hardware_details()
+        if (not self.is_offline_target or self._probed_target_os) and patchset_obj.can_unpatch is False:
             logging.error("- Cannot continue with unpatching!!!")
             patchset_obj.detailed_errors()
             return
@@ -629,4 +874,22 @@ class PatchSysVolume:
             logging.error("- Failed to mount root volume, cannot continue with unpatching!!!")
             return
 
-        self._unpatch_root_vol()
+        try:
+            if self.is_offline_target and not self._probed_target_os:
+                self._probed_target_os = self._sync_target_os_metadata(
+                    target_root=self.mount_location,
+                    preboot_root=self.mount_obj.preboot_mount,
+                )
+                patchset_obj = self._detect_hardware_details()
+                self.hardware_details = patchset_obj.device_properties
+                self._refresh_target_flags()
+                if patchset_obj.can_unpatch is False:
+                    logging.error("- Cannot continue with unpatching!!!")
+                    patchset_obj.detailed_errors()
+                    self._unmount_root_vol()
+                    return
+
+            self._unpatch_root_vol()
+        finally:
+            if self.is_offline_target and not self.constants.root_patcher_succeeded:
+                self._unmount_root_vol()

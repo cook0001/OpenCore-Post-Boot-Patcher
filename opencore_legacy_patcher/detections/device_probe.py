@@ -869,19 +869,34 @@ class Computer:
             self.storage.append(NVMeController.from_ioregistry(device))
             ioreg.IOObjectRelease(device)
 
+    @staticmethod
+    def _decode_ioreg_property(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.strip(b"\0").decode("utf-8", errors="ignore")
+        return str(value).strip("\0")
+
     def smbios_probe(self):
         # Reported model
-        entry = next(ioreg.ioiterator_to_list(ioreg.IOServiceGetMatchingServices(ioreg.kIOMasterPortDefault, ioreg.IOServiceMatching("IOPlatformExpertDevice".encode()), None)[1]))
-        self.reported_model = ioreg.corefoundation_to_native(ioreg.IORegistryEntryCreateCFProperty(entry, "model", ioreg.kCFAllocatorDefault, ioreg.kNilOptions)).strip(b"\0").decode()  # type: ignore
-        translated = subprocess.run(["/usr/sbin/sysctl", "-in", "sysctl.proc_translated"], stdout=subprocess.PIPE).stdout.decode()
-        if translated:
-            board = "target-type"
-        else:
-            board = "board-id"
-        self.reported_board_id = ioreg.corefoundation_to_native(ioreg.IORegistryEntryCreateCFProperty(entry, board, ioreg.kCFAllocatorDefault, ioreg.kNilOptions)).strip(b"\0").decode()  # type: ignore
-        self.uuid_sha1 = ioreg.corefoundation_to_native(ioreg.IORegistryEntryCreateCFProperty(entry, "IOPlatformUUID", ioreg.kCFAllocatorDefault, ioreg.kNilOptions))  # type: ignore
-        self.uuid_sha1 = hashlib.sha1(self.uuid_sha1.encode()).hexdigest()
-        ioreg.IOObjectRelease(entry)
+        entry = next(ioreg.ioiterator_to_list(ioreg.IOServiceGetMatchingServices(ioreg.kIOMasterPortDefault, ioreg.IOServiceMatching("IOPlatformExpertDevice".encode()), None)[1]), None)
+        if entry:
+            self.reported_model = self._decode_ioreg_property(
+                ioreg.corefoundation_to_native(ioreg.IORegistryEntryCreateCFProperty(entry, "model", ioreg.kCFAllocatorDefault, ioreg.kNilOptions))
+            )
+            translated = subprocess.run(["/usr/sbin/sysctl", "-in", "sysctl.proc_translated"], stdout=subprocess.PIPE).stdout.decode()
+            if translated:
+                board = "target-type"
+            else:
+                board = "board-id"
+            self.reported_board_id = self._decode_ioreg_property(
+                ioreg.corefoundation_to_native(ioreg.IORegistryEntryCreateCFProperty(entry, board, ioreg.kCFAllocatorDefault, ioreg.kNilOptions))
+            )
+            platform_uuid = self._decode_ioreg_property(
+                ioreg.corefoundation_to_native(ioreg.IORegistryEntryCreateCFProperty(entry, "IOPlatformUUID", ioreg.kCFAllocatorDefault, ioreg.kNilOptions))
+            )
+            self.uuid_sha1 = hashlib.sha1(platform_uuid.encode()).hexdigest() if platform_uuid else None
+            ioreg.IOObjectRelease(entry)
 
         # Real model
         self.real_model = utilities.get_nvram("oem-product", "4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102", decode=True) or self.reported_model
@@ -990,9 +1005,19 @@ class Computer:
     def sata_disk_probe(self):
         # Get all SATA Controllers/Disks from 'system_profiler SPSerialATADataType'
         # Determine whether SATA SSD is present and Apple-made
-        sp_sata_data = plistlib.loads(subprocess.run(["/usr/sbin/system_profiler", "SPSerialATADataType", "-xml"], stdout=subprocess.PIPE).stdout.decode().strip().encode())
+        system_profiler = Path("/usr/sbin/system_profiler")
+        if not system_profiler.exists():
+            return
+        try:
+            result = subprocess.run([str(system_profiler), "SPSerialATADataType", "-xml"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            if result.returncode != 0 or not result.stdout.strip():
+                return
+            sp_sata_data = plistlib.loads(result.stdout.decode().strip().encode())
+        except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException, UnicodeDecodeError, TypeError):
+            return
+
         for root in sp_sata_data:
-            for ahci_controller in root["_items"]:
+            for ahci_controller in root.get("_items", []):
                 # Each AHCI controller will have its own entry
                 # Skip entries that are AHCI PCIe controllers
                 # Apple's AHCI PCIe controller will report 'PCI' interconnect
@@ -1009,12 +1034,16 @@ class Computer:
                     # - 'spsata_physical_interconnect' was not introduced till 10.9
                     continue
 
-    def oclp_sys_patch_probe(self):
-        path = Path("/System/Library/CoreServices/OpenCore-Legacy-Patcher.plist")
+    def oclp_sys_patch_probe(self, root_path: str = "/"):
+        path = Path(root_path) / "System/Library/CoreServices/OpenCore-Legacy-Patcher.plist"
         if not path.exists():
             self.oclp_sys_signed = True  # No plist, so assume root is valid
             return
-        sys_plist = plistlib.load(path.open("rb"))
+        try:
+            with path.open("rb") as f:
+                sys_plist = plistlib.load(f)
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            return
         if sys_plist:
             if "OpenCore Legacy Patcher" in sys_plist:
                 self.oclp_sys_version = sys_plist["OpenCore Legacy Patcher"]

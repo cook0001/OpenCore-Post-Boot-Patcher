@@ -15,10 +15,8 @@ from . import subprocess_wrapper
 
 from .. import constants
 
-from ..wx_gui import gui_entry
 from ..efi_builder import build
 from ..sys_patch import sys_patch
-from ..sys_patch.auto_patcher import StartAutomaticPatching
 
 from ..datasets import (
     model_array,
@@ -36,12 +34,60 @@ from . import (
 # Generic building args
 class arguments:
 
-    def __init__(self, global_constants: constants.Constants) -> None:
+    def __init__(self, global_constants: constants.Constants, parsed_args=None) -> None:
         self.constants: constants.Constants = global_constants
 
-        self.args = utilities.check_cli_args()
+        self.args = parsed_args if parsed_args is not None else utilities.check_cli_args()
 
         self._parse_arguments()
+
+
+    def _configure_ocpbp_context(self) -> None:
+        """
+        Apply optional --model / --offline_assets_dir / /Volumes/OCPBP auto-discovery
+        for OCPBP and offline patching commands.
+        """
+        from ..ocpbp import esp_sync
+
+        if getattr(self.args, "offline_assets_dir", None):
+            try:
+                discovered = esp_sync.discover_offline_assets_dir(
+                    explicit_dir=self.args.offline_assets_dir,
+                    global_constants=self.constants,
+                )
+                self.constants.offline_assets_dir = discovered
+            except FileNotFoundError as exc:
+                logging.error(str(exc))
+                sys.exit(1)
+        elif self.constants.offline_assets_dir is None:
+            discovered = esp_sync.discover_offline_assets_dir(
+                explicit_dir=None,
+                global_constants=self.constants,
+            )
+            if discovered is not None:
+                self.constants.offline_assets_dir = discovered
+
+        if getattr(self.args, "model", None) and not self.args.build:
+            requested_model = self.args.model
+            if (
+                requested_model not in model_array.SupportedSMBIOS
+                and not getattr(self.args, "support_all", False)
+                and not self.constants.allow_oc_everywhere
+            ):
+                logging.error(f"Unsupported custom model: {requested_model}")
+                sys.exit(1)
+            self.constants.custom_model = requested_model
+            defaults.GenerateDefaults(
+                requested_model,
+                False,
+                self.constants,
+                ignore_settings_file=True,
+            )
+
+        if getattr(self.args, "target_vol", None):
+            self.constants.target_vol = self.args.target_vol
+        elif getattr(self.args, "unpatch_target_vol", None):
+            self.constants.target_vol = self.args.unpatch_target_vol
 
 
     def _parse_arguments(self) -> None:
@@ -49,8 +95,41 @@ class arguments:
         Parses arguments passed to the patcher
         """
 
+        if self.args is None:
+            self._ocpbp_tui_handler()
+            return
+
         if self.args.validate:
             self._validation_handler()
+            return
+
+        if (
+            self.args.ocpbp
+            or self.args.target_vol
+            or self.args.unpatch_target_vol
+            or self.args.sync_esp
+            or self.args.offline_assets_dir
+        ):
+            self._configure_ocpbp_context()
+
+        if self.args.ocpbp:
+            self._ocpbp_tui_handler()
+            return
+
+        if self.args.target_vol:
+            self._target_patch_handler()
+            if self.args.sync_esp:
+                self._sync_esp_handler()
+            return
+
+        if self.args.unpatch_target_vol:
+            self._target_unpatch_handler()
+            if self.args.sync_esp:
+                self._sync_esp_handler()
+            return
+
+        if self.args.sync_esp:
+            self._sync_esp_handler()
             return
 
         if self.args.build:
@@ -86,6 +165,96 @@ class arguments:
         validation.PatcherValidation(self.constants)
 
 
+    def _ocpbp_tui_handler(self) -> None:
+        """
+        Launch interactive Recovery Terminal UI without GUI dependencies
+        """
+        from ..ocpbp import tui
+
+        assets_dir = getattr(self.args, "offline_assets_dir", None) if self.args else None
+        ui = tui.OCPBPTerminalUI(self.constants, offline_assets_dir=assets_dir)
+        exit_code = ui.run()
+        if exit_code:
+            sys.exit(exit_code)
+
+
+    def _target_patch_handler(self) -> None:
+        """
+        Start offline root volume patching for --target_vol
+        """
+        target_vol = self.args.target_vol
+        model = self.constants.custom_model or self.constants.computer.real_model
+        interactive = bool(
+            getattr(self.args, "interactive_unlock", False)
+            or (sys.stdin is not None and sys.stdin.isatty())
+        )
+        logging.info(f"Starting offline OCPBP target volume patching for: {target_vol}")
+        patcher = sys_patch.PatchSysVolume(
+            model,
+            self.constants,
+            None,
+            target_vol=target_vol,
+            offline_assets_dir=self.constants.offline_assets_dir,
+            passphrase=getattr(self.args, "passphrase", None),
+            interactive_unlock=interactive,
+        )
+        patcher.start_patch()
+        if patcher.patch_set_dictionary != {} and not self.constants.root_patcher_succeeded:
+            logging.error(f"Offline root volume patching failed for target: {target_vol}")
+            sys.exit(1)
+
+
+    def _target_unpatch_handler(self) -> None:
+        """
+        Start offline root volume unpatching for --unpatch_target_vol
+        """
+        target_vol = self.args.unpatch_target_vol
+        model = self.constants.custom_model or self.constants.computer.real_model
+        interactive = bool(
+            getattr(self.args, "interactive_unlock", False)
+            or (sys.stdin is not None and sys.stdin.isatty())
+        )
+        logging.info(f"Starting offline OCPBP target volume unpatching for: {target_vol}")
+        patcher = sys_patch.PatchSysVolume(
+            model,
+            self.constants,
+            None,
+            target_vol=target_vol,
+            offline_assets_dir=self.constants.offline_assets_dir,
+            passphrase=getattr(self.args, "passphrase", None),
+            interactive_unlock=interactive,
+        )
+        patcher.start_unpatch()
+        if not self.constants.root_patcher_succeeded:
+            logging.error(f"Offline root volume unpatching failed for target: {target_vol}")
+            sys.exit(1)
+
+
+    def _sync_esp_handler(self) -> None:
+        """
+        Rebuild and install root-patch-ready OpenCore onto an internal ESP
+        """
+        from ..ocpbp import esp_sync
+        from ..sys_patch.mount import mount
+
+        target_group = None
+        target_ref = getattr(self.args, "target_vol", None) or getattr(self.args, "unpatch_target_vol", None)
+        if target_ref:
+            try:
+                target_group = mount.APFSVolumeResolver().resolve_target(target_ref)
+            except Exception as exc:
+                logging.warning(f"Could not resolve target group for ESP prioritization: {exc}")
+
+        manager = esp_sync.ESPSyncManager(self.constants)
+        result = manager.sync_internal_esp(
+            esp_partition=getattr(self.args, "esp_disk", None),
+            target_group=target_group,
+            model=self.constants.custom_model,
+            mode="rebuild",
+        )
+        logging.info(f"Internal ESP sync completed: {result}")
+
+
     def _sys_patch_handler(self) -> None:
         """
         Start root volume patching
@@ -117,6 +286,7 @@ class arguments:
         """
 
         logging.info("Set Auto patching")
+        from ..sys_patch.auto_patcher.start import StartAutomaticPatching
         StartAutomaticPatching(self.constants).start_auto_patch()
 
 
@@ -148,6 +318,7 @@ class arguments:
             logging.info("Another instance of OS caching is running, exiting")
             return
 
+        from ..wx_gui import gui_entry
         gui_entry.EntryPoint(self.constants).start(entry=gui_entry.SupportedEntryPoints.OS_CACHE)
 
 

@@ -48,8 +48,31 @@ class os_conversion:
         """
         if os.startswith("10."):
             return (int(os.split(".")[1]) + 4)
-        else:
-            return (int(os.split(".")[0]) + 9)
+        major = int(os.split(".")[0])
+        if major >= 26:
+            return major - 1
+        return major + 9
+
+
+    def os_to_kernel_minor(os_version: str) -> int:
+        """
+        Convert OS version string to minor XNU version when direct kernel
+        metadata is unavailable.
+        """
+        parts = os_version.split(".")
+        if os_version.startswith("10."):
+            return int(parts[2]) if len(parts) > 2 else 0
+
+        major = int(parts[0])
+        os_minor = int(parts[1]) if len(parts) > 1 else 0
+
+        if major == 11:
+            if os_minor == 0:
+                return 0
+            return min(os_minor + 1, 6)
+        if major in (12, 13):
+            return os_minor + 1
+        return os_minor
 
 
     def kernel_to_os(kernel: int) -> str:
@@ -62,6 +85,8 @@ class os_conversion:
         Returns:
             str: OS version
         """
+        if kernel >= os_data.tahoe:
+            return str(kernel + 1)
         if kernel >= os_data.big_sur:
             return str((kernel - 9))
         else:

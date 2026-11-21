@@ -12,8 +12,6 @@ from pathlib import Path
 
 from . import constants
 
-from .wx_gui import gui_entry
-
 from .detections import (
     device_probe,
     os_probe
@@ -34,14 +32,18 @@ class OpenCoreLegacyPatcher:
     Initial entry point for starting OpenCore Legacy Patcher
     """
 
-    def __init__(self) -> None:
+    def __init__(self, headless: bool = False) -> None:
+        self.headless: bool = headless
         self.constants: constants.Constants = constants.Constants()
+        self.constants.ocpbp_cli_mode = headless
 
         logging_handler.InitializeLoggingSupport(self.constants)
 
-        self._generate_base_data()
+        cli_args = utilities.check_cli_args()
+        self._generate_base_data(cli_args)
 
-        if utilities.check_cli_args() is None:
+        if cli_args is None and not self.headless:
+            from .wx_gui import gui_entry
             gui_entry.EntryPoint(self.constants).start()
 
 
@@ -59,15 +61,30 @@ class OpenCoreLegacyPatcher:
             logging.warning(f"Current working directory was invalid, switched to: {_test_dir}")
 
 
-    def _generate_base_data(self) -> None:
+    def _generate_base_data(self, cli_args=None) -> None:
         """
         Generate base data required for the patcher to run
         """
 
-        self.constants.wxpython_variant = True
+        is_ocpbp_invocation = bool(
+            self.headless
+            or (
+                cli_args is not None
+                and (
+                    cli_args.ocpbp
+                    or cli_args.target_vol
+                    or cli_args.unpatch_target_vol
+                    or cli_args.sync_esp
+                )
+            )
+        )
+        self.constants.wxpython_variant = not is_ocpbp_invocation
 
         # Ensure we live after parent process dies (ie. LaunchAgent)
-        os.setpgrp()
+        try:
+            os.setpgrp()
+        except OSError:
+            pass
 
         # Generate OS data
         os_data = os_probe.OSProbe()
@@ -107,16 +124,20 @@ class OpenCoreLegacyPatcher:
         # Generate commit info
         self.constants.commit_info = commit_info.ParseCommitInfo(self.constants.launcher_binary).generate_commit_info()
         if self.constants.commit_info[0] not in ["Running from source", "Built from source"]:
-            # Now that we have commit info, update nightly link
-            branch = self.constants.commit_info[0]
-            branch = branch.replace("refs/heads/", "")
-            self.constants.installer_pkg_url_nightly = self.constants.installer_pkg_url_nightly.replace("main", branch)
+            ref = self.constants.commit_info[0]
+            if ref.startswith("refs/tags/"):
+                tag = ref.removeprefix("refs/tags/")
+                self.constants.installer_pkg_url = f"{self.constants.repo_link}/releases/download/{tag}/AutoPkg-Assets.pkg"
+            elif ref.startswith("refs/heads/"):
+                branch = ref.removeprefix("refs/heads/")
+                self.constants.installer_pkg_url_nightly = self.constants.installer_pkg_url_nightly.replace("/main/", f"/{branch}/")
 
         # Generate defaults
         defaults.GenerateDefaults(self.computer.real_model, True, self.constants)
-        threading.Thread(target=analytics_handler.Analytics(self.constants).send_analytics).start()
+        if not is_ocpbp_invocation:
+            threading.Thread(target=analytics_handler.Analytics(self.constants).send_analytics).start()
 
-        if utilities.check_cli_args() is None:
+        if cli_args is None and not self.headless:
             self.constants.cli_mode = False
             return
 
@@ -124,7 +145,11 @@ class OpenCoreLegacyPatcher:
         self.constants.gui_mode = True  # Assumes no user interaction is required
 
         ignore_args = ["--auto_patch", "--gui_patch", "--gui_unpatch", "--update_installed"]
-        if not any(x in sys.argv for x in ignore_args):
+        if (
+            not any(x in sys.argv for x in ignore_args)
+            and not is_ocpbp_invocation
+            and self.constants.launcher_script
+        ):
             self.constants.current_path = Path.cwd()
         ignore_args = ignore_args.pop(0)
 
@@ -132,10 +157,10 @@ class OpenCoreLegacyPatcher:
             while self.constants.unpack_thread.is_alive():
                 time.sleep(self.constants.thread_sleep_interval)
 
-        arguments.arguments(self.constants)
+        arguments.arguments(self.constants, parsed_args=cli_args)
 
-def main():
+def main(headless: bool = False):
     """
     Main entry point
     """
-    OpenCoreLegacyPatcher()
+    OpenCoreLegacyPatcher(headless=headless)

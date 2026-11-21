@@ -48,6 +48,7 @@ def main() -> None:
     # If not specified, will run all steps
     parser.add_argument("--run-as-individual-steps", action="store_true", help="CI: Run as individual steps", default=False)
     parser.add_argument("--prepare-application", action="store_true", help="CI: Prepare Application", default=False)
+    parser.add_argument("--prepare-ocpbp", action="store_true", help="CI: Prepare Headless ocpbp Binary", default=False)
     parser.add_argument("--prepare-package", action="store_true", help="CI: Prepare Package", default=False)
     parser.add_argument("--prepare-assets", action="store_true", help="CI: Prepare Assets", default=False)
 
@@ -74,6 +75,21 @@ def main() -> None:
     if (args.run_as_individual_steps is False) or (args.run_as_individual_steps and args.prepare_assets):
         # Prepare workspace
         disk_images.GenerateDiskImages(args.reset_dmg_cache).generate()
+
+    if (args.run_as_individual_steps is False) or (args.run_as_individual_steps and args.prepare_ocpbp):
+        # Build standalone headless ocpbp binary
+        application.GenerateHeadlessApplication(
+            reset_pyinstaller_cache=args.reset_pyinstaller_cache,
+        ).generate()
+
+        sign_notarize.SignAndNotarize(
+            path=Path("dist/ocpbp"),
+            signing_identity=args.application_signing_identity,
+            notarization_apple_id=args.notarization_apple_id,
+            notarization_password=args.notarization_password,
+            notarization_team_id=args.notarization_team_id,
+            entitlements=Path("./ci_tooling/entitlements/entitlements.plist"),
+        ).sign_and_notarize()
 
     if (args.run_as_individual_steps is False) or (args.run_as_individual_steps and args.prepare_application):
         # Prepare Privileged Helper Tool

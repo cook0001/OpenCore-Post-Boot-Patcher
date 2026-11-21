@@ -13,7 +13,11 @@ from pathlib import Path
 
 from .. import constants
 
-from ..datasets import os_data
+from ..datasets import (
+    model_array,
+    os_data
+)
+from ..ocpbp    import esp_sync
 from ..volume   import generate_copy_arguments
 
 from ..wx_gui import (
@@ -44,6 +48,9 @@ class macOSInstallerFlashFrame(wx.Frame):
         self.available_installers_local: dict = {}
         self.available_disks: dict = {}
         self.prepare_result: bool = False
+        self.build_ocpbp_usb: bool = False
+        self.selected_ocpbp_layout: dict = None
+        self.ocpbp_checkbox: wx.CheckBox = None
 
         self.progress_bar_animation: gui_support.GaugePulseCallback = None
 
@@ -193,25 +200,62 @@ class macOSInstallerFlashFrame(wx.Frame):
         warning_label.Centre(wx.HORIZONTAL)
 
         # List of disks
+        self.ocpbp_checkbox = None
         if self.available_disks:
             spacer = 5
             entries = len(self.available_disks)
+            layouts = {}
             logging.info("Available disks:")
             for disk in self.available_disks:
                 logging.info(f" - {disk}: {self.available_disks[disk]['name']} - {utilities.human_fmt(self.available_disks[disk]['size'])}")
+                layouts[disk] = macos_installer_handler.compute_ocpbp_usb_layout(
+                    self.available_disks[disk]['size'],
+                    installer['Path'],
+                )
                 disk_button = wx.Button(self.frame_modal, label=f"{disk}: {self.available_disks[disk]['name']} - {utilities.human_fmt(self.available_disks[disk]['size'])}", pos=(-1, warning_label.GetPosition()[1] + warning_label.GetSize()[1] + spacer), size=(300, 30))
                 disk_button.Bind(wx.EVT_BUTTON, lambda event, temp=disk: self.on_select_disk(self.available_disks[temp], installer))
                 disk_button.Centre(wx.HORIZONTAL)
                 if entries == 1:
                     disk_button.SetDefault()
                 spacer += 25
+
+            any_fits = any(layout['fits'] for layout in layouts.values())
+            sample_layout = next(iter(layouts.values()))
+
+            self.ocpbp_checkbox = wx.CheckBox(
+                self.frame_modal,
+                label="Build OCPBP USB (3-partition offline Recovery patcher)",
+                pos=(-1, disk_button.GetPosition()[1] + disk_button.GetSize()[1] + 8),
+            )
+            self.ocpbp_checkbox.SetFont(gui_support.font_factory(12, wx.FONTWEIGHT_BOLD))
+            self.ocpbp_checkbox.SetValue(any_fits)
+            self.ocpbp_checkbox.Enable(any_fits)
+            self.ocpbp_checkbox.Centre(wx.HORIZONTAL)
+
+            if any_fits:
+                ocpbp_note_text = "Adds /Volumes/OCPBP with headless ocpbp, KDK, Metallib, & AutoPkg"
+            else:
+                ocpbp_note_text = (
+                    f"OCPBP disabled: needs ~{utilities.human_fmt(sample_layout['required_total_bytes'])} "
+                    "(uses standard 1-partition USB)"
+                )
+
+            ocpbp_note = wx.StaticText(
+                self.frame_modal,
+                label=ocpbp_note_text,
+                pos=(-1, self.ocpbp_checkbox.GetPosition()[1] + self.ocpbp_checkbox.GetSize()[1] + 4),
+            )
+            ocpbp_note.SetFont(gui_support.font_factory(10, wx.FONTWEIGHT_NORMAL))
+            ocpbp_note.Centre(wx.HORIZONTAL)
+            last_widget = ocpbp_note
         else:
             disk_button = wx.StaticText(self.frame_modal, label="No disks found", pos=(-1, warning_label.GetPosition()[1] + warning_label.GetSize()[1] + 5))
             disk_button.SetFont(gui_support.font_factory(13, wx.FONTWEIGHT_BOLD))
             disk_button.Centre(wx.HORIZONTAL)
+            last_widget = disk_button
 
         # Search for disks again
-        search_button = wx.Button(self.frame_modal, label="Search for disks again", pos=(-1, disk_button.GetPosition()[1] + disk_button.GetSize()[1]), size=(150, 30))
+        search_button = wx.Button(self.frame_modal, label="Search for disks again", pos=(-1, last_widget.GetPosition()[1] + last_widget.GetSize()[1] + 8), size=(150, 30))
         search_button.Bind(wx.EVT_BUTTON, lambda event, temp=installer: self.on_select(temp))
         search_button.Centre(wx.HORIZONTAL)
 
@@ -229,6 +273,42 @@ class macOSInstallerFlashFrame(wx.Frame):
 
 
     def on_select_disk(self, disk: dict, installer: dict) -> None:
+        custom_model = self.constants.custom_model
+        custom_model_valid = (
+            custom_model is None
+            or custom_model in model_array.SupportedSMBIOS
+            or self.constants.allow_oc_everywhere
+        )
+        if gui_support.CheckProperties(self.constants).host_can_build() is False or not custom_model_valid:
+            wx.MessageBox(
+                f"Cannot build OpenCore for this machine ({self.constants.computer.real_model}).\n\n"
+                "Please set a valid Target Model in Settings before erasing this USB drive.",
+                "Target Model Required",
+                wx.OK | wx.ICON_WARNING,
+            )
+            return
+
+        ocpbp_checked = bool(self.ocpbp_checkbox and self.ocpbp_checkbox.GetValue())
+        layout = macos_installer_handler.compute_ocpbp_usb_layout(disk['size'], installer['Path'])
+        if ocpbp_checked and not layout['fits']:
+            fallback_answer = wx.MessageBox(
+                f"'{disk['name']}' ({utilities.human_fmt(disk['size'])}) does not have enough capacity for the 3-partition OCPBP layout.\n"
+                f"{layout['reason']}\n\n"
+                "Continue creating a standard 1-partition macOS installer without /Volumes/OCPBP?",
+                "Insufficient Space for OCPBP",
+                wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING,
+            )
+            if fallback_answer != wx.YES:
+                return
+            self.build_ocpbp_usb = False
+            self.selected_ocpbp_layout = None
+        elif ocpbp_checked:
+            self.build_ocpbp_usb = True
+            self.selected_ocpbp_layout = layout
+        else:
+            self.build_ocpbp_usb = False
+            self.selected_ocpbp_layout = None
+
         answer = wx.MessageBox(f"Are you sure you want to erase '{disk['name']}'?\nAll data will be lost, this cannot be undone.", "Confirmation", wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION)
         if answer != wx.YES:
             return
@@ -351,6 +431,9 @@ class macOSInstallerFlashFrame(wx.Frame):
             return
 
         # Install OpenCore
+        if self.build_ocpbp_usb:
+            self.constants.ocpbp_usb_efi_enforce = True
+
         self.Hide()
         gui_build.BuildFrame(
             parent=None,
@@ -364,7 +447,18 @@ class macOSInstallerFlashFrame(wx.Frame):
     def _prepare_resources(self, installer_path: str, disk: str) -> None:
 
         def prepare_script(self, installer_path: str, disk: str, constants: constants.Constants):
-            self.prepare_result = macos_installer_handler.InstallerCreation().generate_installer_creation_script(constants.payload_path, installer_path, disk)
+            partition_size = (
+                self.selected_ocpbp_layout["installer_size_arg"]
+                if self.build_ocpbp_usb and self.selected_ocpbp_layout
+                else None
+            )
+            self.prepare_result = macos_installer_handler.InstallerCreation().generate_installer_creation_script(
+                constants.payload_path,
+                installer_path,
+                disk,
+                ocpbp_enabled=self.build_ocpbp_usb,
+                installer_partition_size=partition_size,
+            )
 
         thread = threading.Thread(target=prepare_script, args=(self, installer_path, disk, self.constants))
         thread.start()
@@ -444,18 +538,61 @@ class macOSInstallerFlashFrame(wx.Frame):
         subprocess.run(["/usr/bin/ditto", "-V", "-x", "-k", "--sequesterRsrc", "--rsrc", self.constants.installer_pkg_zip_path, self.constants.payload_path])
 
 
+    def _resolve_ocpbp_mount_point(self, ocpbp_partition: str) -> str:
+        mount_path = utilities.grab_mount_point_from_disk(ocpbp_partition)
+        if mount_path and Path(mount_path).exists():
+            return mount_path
+
+        mount_res = subprocess_wrapper.run_as_root(
+            ["/usr/sbin/diskutil", "mount", ocpbp_partition],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if mount_res.returncode != 0:
+            subprocess_wrapper.log(mount_res)
+            return ""
+
+        mount_path = utilities.grab_mount_point_from_disk(ocpbp_partition)
+        return mount_path if mount_path and Path(mount_path).exists() else ""
+
+
     def _install_installer_pkg(self, disk):
-        disk = disk + "s2" # ESP sits at 1, and we know macOS will have created the main partition at 2
+        installer_part = disk + "s2"  # ESP sits at 1, main installer partition sits at 2
+        ocpbp_part = disk + "s3"
+
+        path = utilities.grab_mount_point_from_disk(installer_part)
+        sysver_path = Path(path) / "System/Library/CoreServices/SystemVersion.plist"
+        if not path or not sysver_path.exists():
+            return
+
+        with sysver_path.open("rb") as sysver_file:
+            os_version = plistlib.load(sysver_file)
+        kernel_version = os_data.os_conversion.os_to_kernel(os_version["ProductVersion"])
+
+        if self.build_ocpbp_usb:
+            ocpbp_mount = self._resolve_ocpbp_mount_point(ocpbp_part)
+            if not ocpbp_mount:
+                logging.error(f"Failed to locate OCPBP partition mount point for {ocpbp_part}")
+                return
+
+            logging.info(f"Populating companion OCPBP Recovery volume at {ocpbp_mount}")
+            target_model = self.constants.custom_model or self.constants.computer.real_model
+            macos_installer_handler.InstallerCreation().populate_ocpbp_volume(
+                self.constants,
+                ocpbp_mount,
+                installer_os_version=os_version["ProductVersion"],
+                installer_build=os_version["ProductBuildVersion"],
+                target_model=target_model,
+            )
+
+            if int(kernel_version) >= os_data.os_data.big_sur:
+                self._chainload_metallib(os_version["ProductBuildVersion"], os_version["ProductVersion"], Path(ocpbp_mount))
+                self._kdk_chainload(os_version["ProductBuildVersion"], os_version["ProductVersion"], Path(ocpbp_mount))
+            return
 
         if not Path(self.constants.installer_pkg_path).exists():
             return
 
-        path = utilities.grab_mount_point_from_disk(disk)
-        if not Path(path + "/System/Library/CoreServices/SystemVersion.plist").exists():
-            return
-
-        os_version = plistlib.load(Path(path + "/System/Library/CoreServices/SystemVersion.plist").open("rb"))
-        kernel_version = os_data.os_conversion.os_to_kernel(os_version["ProductVersion"])
         if int(kernel_version) < os_data.os_data.big_sur:
             logging.info("Installer unsupported, requires Big Sur or newer")
             return

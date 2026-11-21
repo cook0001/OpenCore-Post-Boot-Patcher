@@ -11,6 +11,7 @@ import logging
 import plistlib
 
 from pathlib import Path
+from typing import Optional
 
 
 class GlobalEnviromentSettings:
@@ -18,9 +19,9 @@ class GlobalEnviromentSettings:
     Library for querying and writing global enviroment settings
     """
 
-    def __init__(self) -> None:
+    def __init__(self, global_settings_folder: Optional[str] = None) -> None:
         self.file_name:              str = ".com.dortania.opencore-legacy-patcher.plist"
-        self.global_settings_folder: str = "/Users/Shared"
+        self.global_settings_folder: str = global_settings_folder or "/Users/Shared"
         self.global_settings_plist:  str = f"{self.global_settings_folder}/{self.file_name}"
 
         self._generate_settings_file()
@@ -32,9 +33,11 @@ class GlobalEnviromentSettings:
         Reads a property from the global settings file
         """
 
-        if Path(self.global_settings_plist).exists():
+        plist_path = Path(self.global_settings_plist)
+        if plist_path.exists():
             try:
-                plist = plistlib.load(Path(self.global_settings_plist).open("rb"))
+                with plist_path.open("rb") as f:
+                    plist = plistlib.load(f)
             except Exception as e:
                 logging.error("Error: Unable to read global settings file")
                 logging.error(e)
@@ -48,9 +51,11 @@ class GlobalEnviromentSettings:
         """
         Deletes a property from the global settings file
         """
-        if Path(self.global_settings_plist).exists():
+        plist_path = Path(self.global_settings_plist)
+        if plist_path.exists():
             try:
-                plist = plistlib.load(Path(self.global_settings_plist).open("rb"))
+                with plist_path.open("rb") as f:
+                    plist = plistlib.load(f)
             except Exception as e:
                 logging.error("Error: Unable to read global settings file")
                 logging.error(e)
@@ -58,8 +63,9 @@ class GlobalEnviromentSettings:
             if property_name in plist:
                 del plist[property_name]
                 try:
-                    plistlib.dump(plist, Path(self.global_settings_plist).open("wb"))
-                except PermissionError:
+                    with plist_path.open("wb") as f:
+                        plistlib.dump(plist, f)
+                except (PermissionError, FileNotFoundError, OSError):
                     logging.info("Failed to write to global settings")
 
 
@@ -68,26 +74,34 @@ class GlobalEnviromentSettings:
         Writes a property to the global settings file
         """
 
-        if Path(self.global_settings_plist).exists():
+        plist_path = Path(self.global_settings_plist)
+        if plist_path.exists():
             try:
-                plist = plistlib.load(Path(self.global_settings_plist).open("rb"))
+                with plist_path.open("rb") as f:
+                    plist = plistlib.load(f)
             except Exception as e:
                 logging.error("Error: Unable to read global settings file")
                 logging.error(e)
                 return
             plist[property_name] = property_value
             try:
-                plistlib.dump(plist, Path(self.global_settings_plist).open("wb"))
-            except PermissionError:
+                with plist_path.open("wb") as f:
+                    plistlib.dump(plist, f)
+            except (PermissionError, FileNotFoundError, OSError):
                 logging.info("Failed to write to global settings file")
 
 
     def _generate_settings_file(self) -> None:
-        if Path(self.global_settings_plist).exists():
+        plist_path = Path(self.global_settings_plist)
+        if plist_path.exists():
+            return
+        if not plist_path.parent.exists():
+            logging.info(f"Global settings folder unavailable, skipping creation: {plist_path.parent}")
             return
         try:
-            plistlib.dump({"Developed by Dortania": True,}, Path(self.global_settings_plist).open("wb"))
-        except PermissionError:
+            with plist_path.open("wb") as f:
+                plistlib.dump({"Developed by Dortania": True,}, f)
+        except (PermissionError, FileNotFoundError, OSError):
             logging.info("Permission error: Unable to write to global settings file")
 
 
@@ -97,27 +111,34 @@ class GlobalEnviromentSettings:
         """
 
         defaults_path = "~/Library/Preferences/com.dortania.opencore-legacy-patcher.plist"
-        defaults_path = Path(defaults_path).expanduser()
+        try:
+            defaults_path = Path(defaults_path).expanduser()
+        except RuntimeError:
+            return
 
-        if Path(defaults_path).exists():
+        plist_path = Path(self.global_settings_plist)
+        if defaults_path.exists() and plist_path.exists():
             # merge defaults with global settings
             try:
-                defaults_plist = plistlib.load(Path(defaults_path).open("rb"))
-                global_settings_plist = plistlib.load(Path(self.global_settings_plist).open("rb"))
+                with defaults_path.open("rb") as f:
+                    defaults_plist = plistlib.load(f)
+                with plist_path.open("rb") as f:
+                    global_settings_plist = plistlib.load(f)
             except Exception as e:
                 logging.error("Error: Unable to read global settings file")
                 logging.error(e)
                 return
             global_settings_plist.update(defaults_plist)
             try:
-                plistlib.dump(global_settings_plist, Path(self.global_settings_plist).open("wb"))
-            except PermissionError:
+                with plist_path.open("wb") as f:
+                    plistlib.dump(global_settings_plist, f)
+            except (PermissionError, FileNotFoundError, OSError):
                 logging.info("Permission error: Unable to write to global settings file")
                 return
 
             # delete defaults plist
             try:
-                Path(defaults_path).unlink()
+                defaults_path.unlink()
             except Exception as e:
                 logging.error("Error: Unable to delete defaults plist")
                 logging.error(e)

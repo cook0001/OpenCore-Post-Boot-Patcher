@@ -3,11 +3,14 @@ sys_patch_helpers.py: Additional support functions for sys_patch.py
 """
 
 import os
+import shlex
+import shutil
 import logging
 import plistlib
+import tempfile
 import subprocess
 
-from typing import Union
+from typing import Optional, Union
 from pathlib import Path
 from datetime import datetime
 
@@ -29,6 +32,64 @@ class SysPatchHelpers:
 
     def __init__(self, global_constants: constants.Constants):
         self.constants: constants.Constants = global_constants
+        self.last_generated_plist_path: Optional[Path] = None
+
+
+    @staticmethod
+    def target_scope_execute_command(
+        process: str,
+        target_data_mount: Optional[Union[str, Path]] = None,
+        as_root: bool = True,
+    ) -> Union[str, list[str]]:
+        """
+        Rewrite PatchType.EXECUTE command arguments so host paths like
+        '/Library/...' or '/private/...' operate against `target_data_mount`
+        when patching offline.
+        """
+        if not target_data_mount or str(target_data_mount) in ("", "/"):
+            return process.split(" ") if as_root else process
+
+        data_root = Path(target_data_mount)
+        tokens = shlex.split(process)
+        rewritten: list[str] = []
+        for token in tokens:
+            if token.startswith("/Library/") or token.startswith("/private/"):
+                rewritten.append(str(data_root / token.lstrip("/")))
+            else:
+                rewritten.append(token)
+        return rewritten
+
+
+    def run_execute_command(
+        self,
+        process: str,
+        as_root: bool = True,
+        target_data_mount: Optional[Union[str, Path]] = None,
+    ) -> None:
+        is_offline = bool(target_data_mount and str(target_data_mount) not in ("", "/"))
+        scoped = self.target_scope_execute_command(process, target_data_mount=target_data_mount, as_root=as_root)
+
+        if is_offline and isinstance(scoped, list):
+            # Ensure parent directory exists when running `defaults write <path> ...`
+            if len(scoped) >= 3 and os.path.basename(scoped[0]) == "defaults" and scoped[1] == "write" and scoped[2].startswith("/"):
+                domain_parent = Path(scoped[2]).parent
+                if not domain_parent.exists():
+                    subprocess_wrapper.run_as_root(["/bin/mkdir", "-p", str(domain_parent)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+            if as_root:
+                logging.info(f"- Running Process as Root:\n{' '.join(shlex.quote(x) for x in scoped)}")
+                subprocess_wrapper.run_as_root_and_verify(scoped, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            else:
+                logging.info(f"- Running Process:\n{' '.join(shlex.quote(x) for x in scoped)}")
+                subprocess_wrapper.run_and_verify(scoped, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            return
+
+        if as_root:
+            logging.info(f"- Running Process as Root:\n{process}")
+            subprocess_wrapper.run_as_root_and_verify(scoped, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        else:
+            logging.info(f"- Running Process:\n{process}")
+            subprocess_wrapper.run_and_verify(scoped, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True)
 
 
     def snb_board_id_patch(self, source_files_path: str):
@@ -72,12 +133,22 @@ class SysPatchHelpers:
 
         with open(path, 'rb') as f:
             data = f.read()
-            data = data.replace(board_to_patch_hex, reported_board_hex)
-            with open(path, 'wb') as f:
-                f.write(data)
+        data = data.replace(board_to_patch_hex, reported_board_hex)
+        with open(path, 'wb') as f:
+            f.write(data)
 
 
-    def generate_patchset_plist(self, patchset: dict, file_name: str, kdk_used: Path, metallib_used: Path):
+    def generate_patchset_plist(
+        self,
+        patchset: dict,
+        file_name: str,
+        kdk_used: Path,
+        metallib_used: Path,
+        output_dir: Optional[Union[str, Path]] = None,
+        detected_os: Optional[int] = None,
+        detected_os_minor: Optional[int] = None,
+        detected_os_build: Optional[str] = None,
+    ):
         """
         Generate patchset file for user reference
 
@@ -91,8 +162,21 @@ class SysPatchHelpers:
 
         """
 
-        source_path = f"{self.constants.payload_path}"
-        source_path_file = f"{source_path}/{file_name}"
+        if output_dir is not None:
+            source_dir = Path(output_dir)
+            source_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            payload_dir = Path(self.constants.payload_path)
+            if payload_dir.is_dir() and os.access(payload_dir, os.W_OK):
+                source_dir = payload_dir
+            else:
+                source_dir = Path(tempfile.mkdtemp(prefix="ocpbp_plist_"))
+
+        source_path_file = source_dir / file_name
+
+        target_os = detected_os if detected_os is not None else self.constants.detected_os
+        target_minor = detected_os_minor if detected_os_minor is not None else self.constants.detected_os_minor
+        target_build = detected_os_build if detected_os_build is not None else self.constants.detected_os_build
 
         kdk_string = "Not applicable"
         if kdk_used:
@@ -109,25 +193,31 @@ class SysPatchHelpers:
             "Commit URL": f"{self.constants.commit_info[2]}",
             "Kernel Debug Kit Used": f"{kdk_string}",
             "Metal Library Used": f"{metallib_used_string}",
-            "OS Version": f"{self.constants.detected_os}.{self.constants.detected_os_minor} ({self.constants.detected_os_build})",
+            "OS Version": f"{target_os}.{target_minor} ({target_build})",
             "Custom Signature": bool(Path(self.constants.payload_local_binaries_root_path / ".signed").exists()),
         }
 
         data.update(patchset)
 
-        if Path(source_path_file).exists():
+        if source_path_file.exists():
             os.remove(source_path_file)
 
-        # Need to write to a safe location
-        plistlib.dump(data, Path(source_path_file).open("wb"), sort_keys=False)
+        with source_path_file.open("wb") as f:
+            plistlib.dump(data, f, sort_keys=False)
 
-        if Path(source_path_file).exists():
+        self.last_generated_plist_path = source_path_file
+
+        if source_path_file.exists():
             return True
 
         return False
 
 
-    def disable_window_server_caching(self):
+    def disable_window_server_caching(
+        self,
+        target_data_mount: Optional[Union[str, Path]] = None,
+        detected_os: Optional[int] = None,
+    ):
         """
         Disable WindowServer's asset caching
 
@@ -138,7 +228,16 @@ class SysPatchHelpers:
         And force macOS into properly generating the Opaque shaders
         """
 
-        if self.constants.detected_os < os_data.os_data.ventura:
+        target_os = detected_os if detected_os is not None else self.constants.detected_os
+        if target_os < os_data.os_data.ventura:
+            return
+
+        if target_data_mount and str(target_data_mount) not in ("", "/"):
+            logging.info("Clearing offline WindowServer caches (runtime chflags uchg deferred to first boot)")
+            var_folders = Path(target_data_mount) / "private/var/folders"
+            if var_folders.is_dir():
+                for cache_dir in var_folders.glob("*/*/*/WindowServer/com.apple.WindowServer"):
+                    subprocess_wrapper.run_as_root(["/bin/rm", "-rf", str(cache_dir)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             return
 
         logging.info("Disabling WindowServer Caching")
@@ -151,7 +250,11 @@ class SysPatchHelpers:
         #   'chflags nouchg /private/var/folders/*/*/*/WindowServer'
 
 
-    def install_rsr_repair_binary(self):
+    def install_rsr_repair_binary(
+        self,
+        mount_location: Optional[Union[str, Path]] = None,
+        detected_os: Optional[int] = None,
+    ):
         """
         Installs RSRRepair
 
@@ -170,17 +273,44 @@ class SysPatchHelpers:
 
         """
 
-        if self.constants.detected_os < os_data.os_data.big_sur:
+        target_os = detected_os if detected_os is not None else self.constants.detected_os
+        if target_os < os_data.os_data.big_sur:
             return
 
         logging.info("Installing Kernel Collection syncing utility")
+        if mount_location and str(mount_location) not in ("", "/"):
+            mount_base = Path(mount_location)
+            src = Path(self.constants.rsrrepair_userspace_path)
+            if not src.exists():
+                logging.info(f"- Failed to find RSRRepair binary at {src}")
+                return
+
+            target_etc = (mount_base / "private/etc") if (mount_base / "private/etc").is_dir() else (mount_base / "etc")
+            if not target_etc.exists():
+                subprocess_wrapper.run_as_root(["/bin/mkdir", "-p", str(target_etc)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+            dest = target_etc / "rc.server"
+            result = subprocess_wrapper.run_as_root(["/usr/bin/ditto", str(src), str(dest)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            if result.returncode != 0:
+                logging.info("- Failed to install RSRRepair to target root")
+                subprocess_wrapper.log(result)
+                return
+            subprocess_wrapper.run_as_root(["/bin/chmod", "755", str(dest)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            subprocess_wrapper.run_as_root(["/usr/sbin/chown", "root:wheel", str(dest)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            return
+
         result = subprocess_wrapper.run_as_root([self.constants.rsrrepair_userspace_path, "--install"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if result.returncode != 0:
             logging.info("- Failed to install RSRRepair")
             subprocess_wrapper.log(result)
 
 
-    def patch_gpu_compiler_libraries(self, mount_point: Union[str, Path]):
+    def patch_gpu_compiler_libraries(
+        self,
+        mount_point: Union[str, Path],
+        detected_os: Optional[int] = None,
+        detected_os_minor: Optional[int] = None,
+    ):
         """
         Fix GPUCompiler.framework's libraries to resolve linking issues
 
@@ -204,16 +334,19 @@ class SysPatchHelpers:
         Parameters:
             mount_point: The mount point of the target volume
         """
-        if os_data.os_data.sonoma < self.constants.detected_os < os_data.os_data.ventura:
+        target_os = detected_os if detected_os is not None else self.constants.detected_os
+        target_minor = detected_os_minor if detected_os_minor is not None else self.constants.detected_os_minor
+
+        if target_os < os_data.os_data.ventura:
             return
 
-        if self.constants.detected_os == os_data.os_data.ventura:
-            if self.constants.detected_os_minor < 4: # 13.3
+        if target_os == os_data.os_data.ventura:
+            if target_minor < 4: # 13.3
                 return
             BASE_VERSION = "31001"
             GPU_VERSION = f"{BASE_VERSION}.669"
-        elif self.constants.detected_os == os_data.os_data.sonoma:
-            if self.constants.detected_os_minor < 2: # 14.2 Beta 2
+        elif target_os == os_data.os_data.sonoma:
+            if target_minor < 2: # 14.2 Beta 2
                 return
             BASE_VERSION = "32023"
             GPU_VERSION = f"{BASE_VERSION}.26"

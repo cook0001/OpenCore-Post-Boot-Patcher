@@ -3,16 +3,23 @@ macos_installer_handler.py: Handler for local macOS installers
 """
 
 import logging
+import math
+import os
 import plistlib
-import tempfile
-import subprocess
 import re
+import shlex
+import subprocess
+import tempfile
 
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, Union
 
+from .. import constants
 from ..datasets import os_data
 
 from . import (
+    network_handler,
     utilities,
     subprocess_wrapper
 )
@@ -25,7 +32,76 @@ from ..volume import (
 
 APPLICATION_SEARCH_PATH:  str = "/Applications"
 
+DEFAULT_MIN_INSTALLER_PARTITION_BYTES: int = 17_000_000_000
+DEFAULT_MIN_OCPBP_PARTITION_BYTES: int = 4_000_000_000
+DEFAULT_INSTALLER_HEADROOM_BYTES: int = 2_500_000_000
+EFI_PARTITION_OVERHEAD_BYTES: int = 250_000_000
+
 tmp_dir = tempfile.TemporaryDirectory()
+
+
+def measure_installer_app_size(installer_path: Optional[Union[str, Path]]) -> int:
+    """
+    Calculate total apparent file size (bytes) inside a macOS installer .app bundle.
+    """
+    if not installer_path:
+        return 0
+    root = Path(installer_path)
+    if not root.exists():
+        return 0
+
+    total_bytes = 0
+    for dirpath, _, filenames in os.walk(root, followlinks=False):
+        for name in filenames:
+            try:
+                total_bytes += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                continue
+    return total_bytes
+
+
+def compute_ocpbp_usb_layout(
+    disk_size_bytes: int,
+    installer_path: Optional[Union[str, Path]] = None,
+    min_ocpbp_bytes: int = DEFAULT_MIN_OCPBP_PARTITION_BYTES,
+) -> dict:
+    """
+    Calculate whether a USB disk has sufficient capacity for the 3-partition OCPBP GPT layout:
+      1. EFI (GPT ESP)
+      2. OCLP-Installer (JHFS+, dynamically sized for installer + headroom)
+      3. OCPBP (JHFS+, remainder for headless ocpbp binary + offline assets)
+    """
+    app_bytes = measure_installer_app_size(installer_path)
+    effective_app_bytes = app_bytes if app_bytes > 0 else 14_000_000_000
+    installer_needed = max(
+        effective_app_bytes + DEFAULT_INSTALLER_HEADROOM_BYTES,
+        DEFAULT_MIN_INSTALLER_PARTITION_BYTES,
+    )
+    installer_partition_gb = int(math.ceil(installer_needed / 1_000_000_000))
+    allocated_installer_bytes = installer_partition_gb * 1_000_000_000
+    required_total_bytes = allocated_installer_bytes + EFI_PARTITION_OVERHEAD_BYTES + min_ocpbp_bytes
+
+    total_disk_bytes = int(disk_size_bytes)
+    remaining_ocpbp_bytes = max(total_disk_bytes - allocated_installer_bytes - EFI_PARTITION_OVERHEAD_BYTES, 0)
+    fits = total_disk_bytes >= required_total_bytes
+
+    reason = ""
+    if not fits:
+        reason = (
+            f"Needs at least {utilities.human_fmt(required_total_bytes)} "
+            f"(disk is {utilities.human_fmt(total_disk_bytes)})"
+        )
+
+    return {
+        "fits": fits,
+        "disk_size_bytes": total_disk_bytes,
+        "installer_app_bytes": app_bytes,
+        "installer_partition_gb": installer_partition_gb,
+        "installer_size_arg": f"{installer_partition_gb}G",
+        "ocpbp_estimated_bytes": remaining_ocpbp_bytes,
+        "required_total_bytes": required_total_bytes,
+        "reason": reason,
+    }
 
 
 class InstallerCreation():
@@ -56,12 +132,19 @@ class InstallerCreation():
         return True
 
 
-    def generate_installer_creation_script(self, tmp_location: str, installer_path: str, disk: str) -> bool:
+    def generate_installer_creation_script(
+        self,
+        tmp_location: str,
+        installer_path: str,
+        disk: str,
+        ocpbp_enabled: bool = False,
+        installer_partition_size: Optional[str] = None,
+    ) -> bool:
         """
         Creates installer.sh to be piped to OCLP-Helper and run as admin
 
         Script includes:
-        - Format provided disk as HFS+ GPT
+        - Format provided disk as HFS+ GPT (or 3-partition GPT with OCPBP volume)
         - Run createinstallmedia on provided disk
 
         Implementing this into a single installer.sh script allows us to only call
@@ -71,6 +154,8 @@ class InstallerCreation():
             tmp_location (str): Path to temporary directory
             installer_path (str): Path to InstallAssistant.pkg
             disk (str): Disk to install to
+            ocpbp_enabled (bool): Pre-partition GPT disk with EFI + OCLP-Installer + OCPBP
+            installer_partition_size (Optional[str]): Explicit size for OCLP-Installer partition (e.g. '19G')
 
         Returns:
             bool: True if successful, False otherwise
@@ -78,6 +163,7 @@ class InstallerCreation():
 
         additional_args = ""
         script_location = Path(tmp_location) / Path("Installer.sh")
+        original_app_size = measure_installer_app_size(installer_path)
 
         # Due to a bug in createinstallmedia, running from '/Applications' may sometimes error:
         #   'Failed to extract AssetData/boot/Firmware/Manifests/InstallerBoot/*'
@@ -119,9 +205,10 @@ class InstallerCreation():
             logging.info(f"Installer has broken code signature")
             return False
 
-        plist_path = str(Path(installer_path) / Path("Contents/Info.plist"))
-        if Path(plist_path).exists():
-            plist = plistlib.load(Path(plist_path).open("rb"))
+        plist_path = Path(installer_path) / Path("Contents/Info.plist")
+        if plist_path.exists():
+            with plist_path.open("rb") as plist_file:
+                plist = plistlib.load(plist_file)
             if "DTPlatformVersion" in plist:
                 platform_version = plist["DTPlatformVersion"]
                 platform_version = platform_version.split(".")[0]
@@ -134,7 +221,24 @@ class InstallerCreation():
         script_location.touch()
 
         with script_location.open("w") as script:
-            script.write(f'''#!/bin/bash
+            if ocpbp_enabled:
+                size_arg = installer_partition_size
+                if not size_arg:
+                    app_bytes = original_app_size or measure_installer_app_size(installer_path) or 14_000_000_000
+                    size_gb = int(math.ceil(max(app_bytes + DEFAULT_INSTALLER_HEADROOM_BYTES, DEFAULT_MIN_INSTALLER_PARTITION_BYTES) / 1_000_000_000))
+                    size_arg = f"{size_gb}G"
+                partition_cmd = (
+                    f"/usr/sbin/diskutil partitionDisk {shlex.quote(disk)} GPT "
+                    f"JHFS+ OCLP-Installer {shlex.quote(size_arg)} JHFS+ OCPBP R"
+                )
+                script.write(
+                    "#!/bin/bash\n"
+                    f"if {partition_cmd}; then\n"
+                    f"    {shlex.quote(createinstallmedia_path)} --volume /Volumes/OCLP-Installer --nointeraction{additional_args}\n"
+                    "fi\n"
+                )
+            else:
+                script.write(f'''#!/bin/bash
 erase_disk='/usr/sbin/diskutil eraseDisk HFS+ OCLP-Installer {disk}'
 if $erase_disk; then
     "{createinstallmedia_path}" --volume /Volumes/OCLP-Installer --nointeraction{additional_args}
@@ -143,6 +247,132 @@ fi
         if Path(script_location).exists():
             return True
         return False
+
+
+    @staticmethod
+    def locate_ocpbp_binary(global_constants: constants.Constants) -> Optional[Path]:
+        """
+        Locate the compiled standalone headless `ocpbp` executable when available.
+        """
+        candidates: list[Path] = []
+        if getattr(global_constants, "launcher_binary", None):
+            launcher_path = Path(global_constants.launcher_binary)
+            candidates.append(launcher_path.parent / "ocpbp")
+            candidates.append(launcher_path.parent.parent / "Resources" / "ocpbp")
+        if getattr(global_constants, "original_path", None):
+            orig = Path(global_constants.original_path)
+            candidates.append(orig / "ocpbp")
+            candidates.append(orig / "dist" / "ocpbp")
+        candidates.append(Path.cwd() / "dist" / "ocpbp")
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
+
+
+    @staticmethod
+    def _write_ocpbp_launcher(ocpbp_mount: Path) -> Path:
+        launcher = ocpbp_mount / "ocpbp.command"
+        launcher.write_text(
+            "#!/bin/bash\n"
+            'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+            'if [ -x "$SCRIPT_DIR/ocpbp" ]; then\n'
+            '    exec "$SCRIPT_DIR/ocpbp" --ocpbp --offline_assets_dir "$SCRIPT_DIR" "$@"\n'
+            "fi\n"
+            'echo "Standalone ocpbp binary was not bundled at $SCRIPT_DIR/ocpbp."\n'
+            'echo "Build it with: python3 Build-Project.command --prepare-ocpbp"\n'
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        os.chmod(launcher, 0o755)
+        return launcher
+
+
+    def populate_ocpbp_volume(
+        self,
+        global_constants: constants.Constants,
+        ocpbp_mount_path: Union[str, Path],
+        installer_os_version: str = "",
+        installer_build: str = "",
+        target_model: str = "",
+        download_if_missing: bool = True,
+    ) -> dict:
+        """
+        Populate the companion /Volumes/OCPBP payload volume without duplicating
+        assets into /Library/Packages on the OCLP-Installer partition.
+        """
+        dest = Path(ocpbp_mount_path)
+        dest.mkdir(parents=True, exist_ok=True)
+        populated: dict[str, Optional[str]] = {
+            "mount_path": str(dest),
+            "ocpbp_binary": None,
+            "launcher": None,
+            "autopkg_assets": None,
+            "universal_binaries": None,
+            "manifest": None,
+        }
+
+        ocpbp_bin = self.locate_ocpbp_binary(global_constants)
+        if ocpbp_bin and ocpbp_bin.is_file():
+            dst_bin = dest / "ocpbp"
+            copy_res = subprocess.run(generate_copy_arguments(str(ocpbp_bin), str(dst_bin)), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            if copy_res.returncode != 0:
+                subprocess_wrapper.log(copy_res)
+                raise RuntimeError(f"Failed to copy ocpbp binary to {dst_bin}")
+            os.chmod(dst_bin, 0o755)
+            populated["ocpbp_binary"] = str(dst_bin)
+        else:
+            logging.warning("Compiled headless 'ocpbp' binary not found; only launcher script created.")
+
+        launcher_path = self._write_ocpbp_launcher(dest)
+        populated["launcher"] = str(launcher_path)
+
+        autopkg_src = Path(global_constants.installer_pkg_path)
+        if autopkg_src.is_file():
+            autopkg_dst = dest / "AutoPkg-Assets.pkg"
+            copy_res = subprocess.run(generate_copy_arguments(str(autopkg_src), str(autopkg_dst)), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            if copy_res.returncode != 0:
+                subprocess_wrapper.log(copy_res)
+                raise RuntimeError(f"Failed to copy AutoPkg-Assets.pkg to {autopkg_dst}")
+            populated["autopkg_assets"] = str(autopkg_dst)
+
+        ub_dst = dest / "Universal-Binaries.dmg"
+        ub_candidates = [
+            Path(global_constants.payload_local_binaries_root_path_dmg),
+            Path(global_constants.original_path) / "Universal-Binaries.dmg",
+        ]
+        ub_src = next((p for p in ub_candidates if p.is_file()), None)
+        if ub_src:
+            copy_res = subprocess.run(generate_copy_arguments(str(ub_src), str(ub_dst)), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            if copy_res.returncode != 0:
+                subprocess_wrapper.log(copy_res)
+                raise RuntimeError(f"Failed to copy Universal-Binaries.dmg to {ub_dst}")
+        elif download_if_missing:
+            ub_url = (
+                f"{global_constants.url_patcher_support_pkg}"
+                f"{global_constants.patcher_support_pkg_version}/Universal-Binaries.dmg"
+            )
+            dl = network_handler.DownloadObject(ub_url, ub_dst)
+            dl.download(spawn_thread=False)
+
+        if ub_dst.is_file():
+            populated["universal_binaries"] = str(ub_dst)
+
+        manifest_path = dest / ".ocpbp-manifest.plist"
+        manifest_data = {
+            "OCPBPVersion": global_constants.ocpbp_version,
+            "PatcherVersion": global_constants.patcher_version,
+            "InstallerOSVersion": installer_os_version,
+            "InstallerBuild": installer_build,
+            "TargetModel": target_model,
+            "CreatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        with manifest_path.open("wb") as handle:
+            plistlib.dump(manifest_data, handle)
+        populated["manifest"] = str(manifest_path)
+
+        return populated
 
 
     def list_disk_to_format(self) -> dict:

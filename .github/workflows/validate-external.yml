@@ -7,11 +7,27 @@ on:
   pull_request:
   workflow_dispatch:
   release:
-    types: [published]
+    types: [published, prereleased]
 
 jobs:
+  unit-tests:
+    name: OCPBP Unit Tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install pure-Python dependencies
+        run: python3 -m pip install packaging py_sip_xnu requests
+      - name: Run OCPBP unit test suite
+        run: python3 -m unittest discover -s tests -v
+      - name: Compile-check source and tests
+        run: python3 -m compileall -q opencore_legacy_patcher tests
+
   build:
-    name: Validate
+    name: Validate (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -22,5 +38,9 @@ jobs:
           cache: 'pip'
       - name: Install Dependencies
         run: python3 -m pip install -r requirements.txt
-      - name: Validate
+      - name: Run OCPBP unit test suite
+        run: python3 -m unittest discover -s tests -v
+      - name: Validate GUI Entry
         run: python3 OpenCore-Patcher-GUI.command --validate
+      - name: Validate Headless ocpbp CLI Entry
+        run: python3 ocpbp_cli.py --validate

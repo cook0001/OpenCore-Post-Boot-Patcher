@@ -16,10 +16,17 @@ from ....support  import subprocess_wrapper
 
 class KernelCacheSupport:
 
-    def __init__(self, mount_location_data: str, detected_os: int, skip_root_kmutil_requirement: bool) -> None:
-        self.mount_location_data = mount_location_data
+    def __init__(self, mount_location_data: str, detected_os: int, skip_root_kmutil_requirement: bool, mount_location: str = "/") -> None:
+        self.mount_location_data = str(mount_location_data or "")
         self.detected_os = detected_os
         self.skip_root_kmutil_requirement = skip_root_kmutil_requirement
+        self.mount_location = str(mount_location or "/")
+
+
+    def _data_root(self) -> Path:
+        if self.mount_location_data and self.mount_location_data != "/":
+            return Path(self.mount_location_data)
+        return Path("/")
 
 
     def check_kexts_needs_authentication(self, kext_name: str) -> bool:
@@ -39,14 +46,15 @@ class KernelCacheSupport:
             return False
 
         try:
-            aux_cache_path = Path(self.mount_location_data) / Path("/private/var/db/KernelExtensionManagement/AuxKC/CurrentAuxKC/com.apple.kcgen.instructions.plist")
+            aux_cache_path = self._data_root() / "private/var/db/KernelExtensionManagement/AuxKC/CurrentAuxKC/com.apple.kcgen.instructions.plist"
             if aux_cache_path.exists():
-                aux_cache_data = plistlib.load((aux_cache_path).open("rb"))
-                for kext in aux_cache_data["kextsToBuild"]:
+                with aux_cache_path.open("rb") as f:
+                    aux_cache_data = plistlib.load(f)
+                for kext in aux_cache_data.get("kextsToBuild", {}):
                     if "bundlePathMainOS" in aux_cache_data["kextsToBuild"][kext]:
                         if aux_cache_data["kextsToBuild"][kext]["bundlePathMainOS"] == f"/Library/Extensions/{kext_name}":
                             return False
-        except PermissionError:
+        except (PermissionError, OSError):
             pass
 
         logging.info(f"  - {kext_name} requires authentication in System Preferences")
@@ -88,11 +96,12 @@ class KernelCacheSupport:
         if self.detected_os < os_data.os_data.ventura:
             return destination_folder_path
 
-        updated_install_location = str(self.mount_location_data) + "/Library/Extensions"
+        updated_install_location = f"{self.mount_location_data}/Library/Extensions" if self.mount_location_data and self.mount_location_data != "/" else "/Library/Extensions"
 
         logging.info(f"  - Adding AuxKC support to {install_file}")
-        plist_path = Path(Path(source_folder_path) / Path(install_file) / Path("Contents/Info.plist"))
-        plist_data = plistlib.load((plist_path).open("rb"))
+        plist_path = Path(source_folder_path) / Path(install_file) / Path("Contents/Info.plist")
+        with plist_path.open("rb") as f:
+            plist_data = plistlib.load(f)
 
         # Check if we need to update the 'OSBundleRequired' entry
         if not plist_data["CFBundleIdentifier"].startswith("com.apple."):
@@ -102,7 +111,8 @@ class KernelCacheSupport:
                 return updated_install_location
 
         plist_data["OSBundleRequired"] = "Auxiliary"
-        plistlib.dump(plist_data, plist_path.open("wb"))
+        with plist_path.open("wb") as f:
+            plistlib.dump(plist_data, f)
 
         return updated_install_location
 
@@ -122,9 +132,14 @@ class KernelCacheSupport:
             return
 
         logging.info("- Cleaning Auxiliary Kernel Collection")
-        oclp_path = "/System/Library/CoreServices/OpenCore-Legacy-Patcher.plist"
-        if Path(oclp_path).exists():
-            oclp_plist_data = plistlib.load(Path(oclp_path).open("rb"))
+        root_base = Path(self.mount_location) if self.mount_location else Path("/")
+        data_base = self._data_root()
+        extensions_dir = data_base / "Library/Extensions"
+        oclp_path = root_base / "System/Library/CoreServices/OpenCore-Legacy-Patcher.plist"
+
+        if oclp_path.exists():
+            with oclp_path.open("rb") as f:
+                oclp_plist_data = plistlib.load(f)
             for key in oclp_plist_data:
                 if isinstance(oclp_plist_data[key], (bool, int)):
                     continue
@@ -137,10 +152,11 @@ class KernelCacheSupport:
                         for file in oclp_plist_data[key][install_type][location]:
                             if not file.endswith(".kext"):
                                 continue
-                            if not Path(f"/Library/Extensions/{file}").exists():
+                            target_kext = extensions_dir / file
+                            if not target_kext.exists():
                                 continue
                             logging.info(f"  - Removing {file}")
-                            subprocess_wrapper.run_as_root(["/bin/rm", "-Rf", f"/Library/Extensions/{file}"])
+                            subprocess_wrapper.run_as_root(["/bin/rm", "-Rf", str(target_kext)])
 
         # Handle situations where users migrated from older OSes with a lot of garbage in /L*/E*
         # ex. Nvidia Web Drivers, NetUSB, dosdude1's patches, etc.
@@ -148,17 +164,21 @@ class KernelCacheSupport:
         if self.detected_os < os_data.os_data.ventura:
             return
 
-        relocation_path = "/Library/Relocated Extensions"
-        if not Path(relocation_path).exists():
-            subprocess_wrapper.run_as_root(["/bin/mkdir", relocation_path])
+        if not extensions_dir.is_dir():
+            return
 
-        for file in Path("/Library/Extensions").glob("*.kext"):
+        relocation_path = data_base / "Library/Relocated Extensions"
+        if not relocation_path.exists():
+            subprocess_wrapper.run_as_root(["/bin/mkdir", "-p", str(relocation_path)])
+
+        for file in extensions_dir.glob("*.kext"):
             try:
                 if datetime.fromtimestamp(file.stat().st_mtime) < datetime(2021, 10, 1):
                     logging.info(f"  - Relocating {file.name} kext to {relocation_path}")
-                    if Path(relocation_path) / Path(file.name).exists():
-                        subprocess_wrapper.run_as_root(["/bin/rm", "-Rf", relocation_path / Path(file.name)])
-                    subprocess_wrapper.run_as_root(["/bin/mv", file, relocation_path])
+                    relocated_file = relocation_path / file.name
+                    if relocated_file.exists():
+                        subprocess_wrapper.run_as_root(["/bin/rm", "-Rf", str(relocated_file)])
+                    subprocess_wrapper.run_as_root(["/bin/mv", str(file), str(relocation_path)])
             except:
                 # Some users have the most cursed /L*/E* folders
                 # ex. Symlinks pointing to symlinks pointing to dead files

@@ -41,7 +41,10 @@ class PathAttributes:
             except:
                 raise ValueError(f"Invalid path: {path}")
 
-        _libc = ctypes.CDLL("/usr/lib/libc.dylib")
+        try:
+            _libc = ctypes.CDLL("/usr/lib/libc.dylib")
+        except OSError:
+            return
 
         # Reference:
         # https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/getattrlist.2.html
