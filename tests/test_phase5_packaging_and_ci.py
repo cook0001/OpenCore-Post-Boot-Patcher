@@ -234,9 +234,17 @@ class Phase5PackagingAndCITests(unittest.TestCase):
         release_yml = (REPO_ROOT / ".github/workflows/build-app-wxpython.yml").read_text(encoding="utf-8")
         self.assertIn("Build-Project.command", release_yml)
         self.assertIn("/Library/Frameworks/Python.framework/Versions/3.11/bin/python3", release_yml)
-        self.assertIn("lipo -archs dist/ocpbp", release_yml)
+        self.assertIn('lipo -archs "$bin"', release_yml)
+        self.assertIn("dist/ocpbp", release_yml)
+        self.assertIn("dist/OpenCore-Patcher.app/Contents/MacOS/OpenCore-Patcher", release_yml)
+        self.assertIn("dist/OpenCore-Patcher.app/Contents/MacOS/ocpbp", release_yml)
+        self.assertIn("x86_64", release_yml)
+        self.assertIn("arm64", release_yml)
         self.assertIn("ocpbp-macos-universal2.zip", release_yml)
         self.assertIn("AutoPkg-Assets.pkg", release_yml)
+
+        reqs = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("wxpython==4.2.2", reqs)
 
     def test_gui_flash_validates_target_model_before_erase_and_uses_partition3(self):
         wx_stub = _AutoWxModule("wx")

@@ -68,9 +68,17 @@ jobs:
 
       - name: Verify Universal2 Mach-O Architectures
         run: |
-          lipo -archs dist/ocpbp
-          lipo -archs dist/OpenCore-Patcher.app/Contents/MacOS/OpenCore-Patcher
-          lipo -archs dist/OpenCore-Patcher.app/Contents/MacOS/ocpbp
+          for bin in \
+            dist/ocpbp \
+            dist/OpenCore-Patcher.app/Contents/MacOS/OpenCore-Patcher \
+            dist/OpenCore-Patcher.app/Contents/MacOS/ocpbp; do
+            archs="$(lipo -archs "$bin")"
+            echo "$bin: $archs"
+            if [[ "$archs" != *"x86_64"* || "$archs" != *"arm64"* ]]; then
+              echo "Expected universal2 (x86_64 + arm64) architectures for $bin, got: $archs" >&2
+              exit 1
+            fi
+          done
 
       - name: Archive Release Artifacts
         run: |
