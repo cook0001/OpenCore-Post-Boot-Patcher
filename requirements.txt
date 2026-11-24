@@ -1,7 +1,7 @@
 requests
 pyobjc
 # wxPython 4.2.2 is the final release shipping macOS universal2 wheels on PyPI
-wxpython==4.2.2
+wxpython==4.3.2
 pyinstaller
 packaging
 py_sip_xnu
